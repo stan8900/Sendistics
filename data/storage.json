@@ -1,0 +1,19 @@
+{
+  "auto": {
+    "message": null,
+    "interval_minutes": 60,
+    "target_chat_ids": [],
+    "is_enabled": false,
+    "stats": {
+      "sent_total": 0,
+      "last_sent_at": null,
+      "last_error": null
+    }
+  },
+  "known_chats": {
+    "-1003169164074": {
+      "chat_id": -1003169164074,
+      "title": "sultan. & rasylon"
+    }
+  }
+}
