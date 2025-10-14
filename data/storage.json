@@ -10,10 +10,59 @@
       "last_error": null
     }
   },
-  "known_chats": {
-    "-1003169164074": {
-      "chat_id": -1003169164074,
-      "title": "sultan. & rasylon"
+  "known_chats": {},
+  "payments": {
+    "938eb559a8ba46a9a52c05f26307686b": {
+      "request_id": "938eb559a8ba46a9a52c05f26307686b",
+      "user_id": 1535189323,
+      "username": "whosjura",
+      "full_name": "sultan.",
+      "card_number": "8600 5704 4332 6425",
+      "card_name": "Sultan Test",
+      "status": "pending",
+      "created_at": "2025-10-08T19:09:49.413996",
+      "resolved_at": null,
+      "resolved_by": null
+    },
+    "89bf3d7ba290490bb3c424d238d2ac43": {
+      "request_id": "89bf3d7ba290490bb3c424d238d2ac43",
+      "user_id": 1535189323,
+      "username": "whosjura",
+      "full_name": "sultan.",
+      "card_number": "8600 5704 4332 6425",
+      "card_name": "Sultan",
+      "status": "pending",
+      "created_at": "2025-10-08T19:12:13.097968",
+      "resolved_at": null,
+      "resolved_by": null
+    },
+    "43826f79fe574d61bec985f1177b561a": {
+      "request_id": "43826f79fe574d61bec985f1177b561a",
+      "user_id": 1535189323,
+      "username": "whosjura",
+      "full_name": "sultan.",
+      "card_number": "1234 5678 9012",
+      "card_name": "Sultan",
+      "status": "pending",
+      "created_at": "2025-10-08T19:12:48.035149",
+      "resolved_at": null,
+      "resolved_by": null
+    },
+    "8f1cf600088b426581813b5cf196b041": {
+      "request_id": "8f1cf600088b426581813b5cf196b041",
+      "user_id": 8164408420,
+      "username": null,
+      "full_name": "Виталий Ким Дзю",
+      "card_number": "8600 5704 4332 6425",
+      "card_name": "Sultan",
+      "status": "approved",
+      "created_at": "2025-10-08T19:14:25.507610",
+      "resolved_at": "2025-10-08T19:14:38.837919",
+      "resolved_by": {
+        "admin_id": 1535189323,
+        "admin_username": "whosjura"
+      }
     }
-  }
+  },
+  "sessions": {}
 }

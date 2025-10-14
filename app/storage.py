@@ -1,9 +1,10 @@
 import asyncio
 import json
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 class Storage:
     def __init__(self, path: Path) -> None:
@@ -23,6 +24,8 @@ class Storage:
                 },
             },
             "known_chats": {},
+            "payments": {},
+            "sessions": {},
         }
         if self._path.exists():
             self._load_sync()
@@ -94,6 +97,125 @@ class Storage:
                 targets.remove(chat_id)
             await self._persist_locked()
 
+    async def create_payment_request(
+        self,
+        *,
+        user_id: int,
+        username: Optional[str],
+        full_name: str,
+        card_number: str,
+        card_name: str,
+    ) -> str:
+        async with self._lock:
+            request_id = uuid4().hex
+            created_at = datetime.utcnow().isoformat()
+            self._data["payments"][request_id] = {
+                "request_id": request_id,
+                "user_id": user_id,
+                "username": username,
+                "full_name": full_name,
+                "card_number": card_number,
+                "card_name": card_name,
+                "status": "pending",
+                "created_at": created_at,
+                "resolved_at": None,
+                "resolved_by": None,
+            }
+            await self._persist_locked()
+            return request_id
+
+    async def set_payment_status(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        admin_id: int,
+        admin_username: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            payment = self._data["payments"].get(request_id)
+            if not payment:
+                return None
+            payment = deepcopy(payment)
+            self._data["payments"][request_id]["status"] = status
+            self._data["payments"][request_id]["resolved_at"] = datetime.utcnow().isoformat()
+            self._data["payments"][request_id]["resolved_by"] = {
+                "admin_id": admin_id,
+                "admin_username": admin_username,
+            }
+            await self._persist_locked()
+            payment.update(self._data["payments"][request_id])
+            return payment
+
+    async def get_payment(self, request_id: str) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            payment = self._data["payments"].get(request_id)
+            return deepcopy(payment) if payment else None
+
+    async def has_recent_payment(self, *, within_days: int) -> bool:
+        async with self._lock:
+            payments = self._data.get("payments", {})
+            if not payments:
+                return False
+            threshold = datetime.utcnow() - timedelta(days=max(0, within_days))
+            for payment in payments.values():
+                if (payment or {}).get("status") != "approved":
+                    continue
+                resolved_at = (payment or {}).get("resolved_at")
+                if not resolved_at:
+                    continue
+                try:
+                    resolved_dt = datetime.fromisoformat(resolved_at)
+                except ValueError:
+                    continue
+                if resolved_dt >= threshold:
+                    return True
+            return False
+
+    async def latest_payment_timestamp(self) -> Optional[datetime]:
+        async with self._lock:
+            payments = self._data.get("payments", {})
+            latest: Optional[datetime] = None
+            for payment in payments.values():
+                if (payment or {}).get("status") != "approved":
+                    continue
+                resolved_at = (payment or {}).get("resolved_at")
+                if not resolved_at:
+                    continue
+                try:
+                    resolved_dt = datetime.fromisoformat(resolved_at)
+                except ValueError:
+                    continue
+                if latest is None or resolved_dt > latest:
+                    latest = resolved_dt
+            return latest
+
+    async def set_user_role(self, user_id: int, role: str) -> None:
+        async with self._lock:
+            self._data["sessions"][str(user_id)] = {
+                "role": role,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            await self._persist_locked()
+
+    async def get_user_role(self, user_id: int) -> Optional[str]:
+        async with self._lock:
+            session = self._data["sessions"].get(str(user_id))
+            if not session:
+                return None
+            return session.get("role")
+
+    async def list_admin_user_ids(self) -> List[int]:
+        async with self._lock:
+            admin_ids = []
+            for key, session in self._data["sessions"].items():
+                if (session or {}).get("role") == "admin":
+                    try:
+                        admin_ids.append(int(key))
+                    except ValueError:
+                        continue
+            return admin_ids
+
     async def ensure_constraints(self) -> None:
         """Disable autoresend if config is incomplete."""
         async with self._lock:
@@ -121,6 +243,8 @@ class Storage:
             return
         loaded = json.loads(raw)
         self._data.update(loaded)
+        self._data.setdefault("payments", {})
+        self._data.setdefault("sessions", {})
 
     def _write_sync(self) -> None:
         self._path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")

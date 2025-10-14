@@ -1,14 +1,19 @@
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("🛠 Авторассылка", callback_data="main:auto")],
-        [InlineKeyboardButton("🔍 Поиск групп", callback_data="main:search")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="main:stats")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings")],
+        [
+            InlineKeyboardButton("⚒ Авторассылка", callback_data="main:auto"),
+            InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay"),
+        ],
+        [
+            InlineKeyboardButton("📊 Статистика", callback_data="main:stats"),
+            InlineKeyboardButton("📋 Выбрать группы", callback_data="main:groups"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -26,13 +31,28 @@ def auto_menu_keyboard(*, is_enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def groups_keyboard(known_chats: Dict[str, Dict[str, str]], selected_ids: Iterable[int]) -> InlineKeyboardMarkup:
+def groups_keyboard(
+    known_chats: Dict[str, Dict[str, str]],
+    selected_ids: Iterable[int],
+    *,
+    origin: str = "auto",
+) -> InlineKeyboardMarkup:
     selected_set = set(selected_ids)
     rows: List[List[InlineKeyboardButton]] = []
     for chat_key, chat_info in sorted(known_chats.items(), key=lambda item: item[1].get("title", "")):
         chat_id = int(chat_key)
         title = chat_info.get("title") or f"Чат {chat_id}"
         prefix = "✅" if chat_id in selected_set else "➕"
-        rows.append([InlineKeyboardButton(f"{prefix} {title[:48]}", callback_data=f"group:{chat_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Готово", callback_data="group:done")])
+        rows.append([
+            InlineKeyboardButton(
+                f"{prefix} {title[:48]}", callback_data=f"group:{origin}:{chat_id}"
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payme_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup()

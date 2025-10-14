@@ -6,5 +6,6 @@ class AutoCampaignStates(StatesGroup):
     waiting_for_interval = State()
 
 
-class GroupSearchStates(StatesGroup):
-    waiting_for_chat_link = State()
+class PaymentStates(StatesGroup):
+    waiting_for_card_number = State()
+    waiting_for_card_name = State()

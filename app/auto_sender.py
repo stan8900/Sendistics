@@ -8,17 +8,20 @@ from .storage import Storage
 
 
 class AutoSender:
-    def __init__(self, bot: Bot, storage: Storage, bot_id: int) -> None:
+    def __init__(self, bot: Bot, storage: Storage, bot_id: int, payment_valid_days: int) -> None:
         self._bot = bot
         self._storage = storage
         self._bot_id = bot_id
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._payment_valid_days = max(0, payment_valid_days)
 
     async def start_if_enabled(self) -> None:
         auto = await self._storage.get_auto()
         if auto.get("is_enabled"):
+            if not await self._payments_ready():
+                return
             await self._ensure_constraints(auto)
             if auto.get("is_enabled"):
                 await self._start_background()
@@ -44,6 +47,9 @@ class AutoSender:
     async def refresh(self) -> None:
         auto = await self._storage.get_auto()
         if auto.get("is_enabled"):
+            if not await self._payments_ready():
+                await self.stop()
+                return
             await self._ensure_constraints(auto)
             if auto.get("is_enabled"):
                 await self.ensure_running()
@@ -54,6 +60,8 @@ class AutoSender:
         while True:
             auto = await self._storage.get_auto()
             if not auto.get("is_enabled"):
+                break
+            if not await self._payments_ready():
                 break
             message = auto.get("message")
             interval = int(auto.get("interval_minutes") or 0)
@@ -102,3 +110,9 @@ class AutoSender:
     async def _is_admin(self, chat_id: int) -> bool:
         member: types.ChatMember = await self._bot.get_chat_member(chat_id, self._bot_id)
         return member.is_chat_admin()
+
+    async def _payments_ready(self) -> bool:
+        if await self._storage.has_recent_payment(within_days=self._payment_valid_days):
+            return True
+        await self._storage.set_auto_enabled(False)
+        return False
