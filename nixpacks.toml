@@ -6,3 +6,6 @@ aptPkgs = [
   "openssl",
   "libssl-dev"
 ]
+
+[variables]
+PYTHON_VERSION = "3.12"
