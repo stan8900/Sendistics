@@ -3,18 +3,25 @@ from typing import Dict, Iterable, List
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton("⚒ Авторассылка", callback_data="main:auto"),
-            InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay"),
-        ],
-        [
-            InlineKeyboardButton("📊 Статистика", callback_data="main:stats"),
-            InlineKeyboardButton("📋 Выбрать группы", callback_data="main:groups"),
-            InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings"),
-        ],
-    ]
+def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+    if is_admin:
+        keyboard = [
+            [
+                InlineKeyboardButton("⚒ Авторассылка", callback_data="main:auto"),
+                InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay"),
+            ],
+            [
+                InlineKeyboardButton("📊 Статистика", callback_data="main:stats"),
+                InlineKeyboardButton("📋 Выбрать группы", callback_data="main:groups"),
+                InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings"),
+            ],
+            [InlineKeyboardButton("📜 Оплаты", callback_data="main:admin_payments")],
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay")],
+            [InlineKeyboardButton("📜 История оплат", callback_data="main:user_payments")],
+        ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -52,7 +59,3 @@ def groups_keyboard(
         InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def payme_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup()

@@ -14,8 +14,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 
 from app.auto_sender import AutoSender
-from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboard, payme_keyboard
-from app.states import AutoCampaignStates, PaymentStates
+from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboard
+from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates
 from app.storage import Storage
 
 
@@ -43,13 +43,21 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
 
-WELCOME_TEXT = (
+WELCOME_TEXT_ADMIN = (
     "👋 Добро пожаловать обратно!\n\n"
     "⚒ Авторассылка — настройка сообщений и расписания\n"
-    "💰 Пополнить баланс — передача данных оператору\n"
+    "💰 Пополнить баланс — контроль оплат пользователей\n"
     "📊 Статистика — просмотр результатов рассылки\n"
     "📋 Выбрать группы — управление чатами\n"
-    "⚙️ Настройки — текущие параметры"
+    "⚙️ Настройки — текущие параметры\n"
+    "📜 Оплаты — список активных и ожидающих платежей"
+)
+
+WELCOME_TEXT_USER = (
+    "👋 Добро пожаловать!\n\n"
+    "💰 Пополнить баланс — отправьте данные оплаты на карту 9860 1701 1433 3116.\n"
+    "📜 История оплат — проверьте статус заявок и срок подписки.\n\n"
+    "Если вы оператор, используйте команду /admin и введите код доступа."
 )
 
 PAYMENT_AMOUNT = 100_000
@@ -63,8 +71,12 @@ STATIC_ADMIN_IDS: Set[int] = {
     if admin_id.strip().isdigit()
 }
 
+ADMIN_INVITE_CODE = os.getenv("ADMIN_CODE", "TW13")
+
 
 async def get_user_role(user_id: int) -> str:
+    if user_id in STATIC_ADMIN_IDS:
+        return "admin"
     role = await storage.get_user_role(user_id)
     return role or "user"
 
@@ -86,6 +98,15 @@ async def is_admin_user(user_id: int) -> bool:
 def format_currency(amount: int, currency: str) -> str:
     formatted = f"{amount:,}".replace(",", " ")
     return f"{formatted} {currency}"
+
+
+def format_datetime(value: Optional[str]) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return value
 
 
 def payment_admin_keyboard(request_id: str) -> InlineKeyboardMarkup:
@@ -144,11 +165,90 @@ def build_payment_admin_text(payment: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def show_main_menu(message: types.Message) -> None:
-    try:
-        await message.edit_text(WELCOME_TEXT, reply_markup=main_menu_keyboard())
-    except exceptions.MessageNotModified:
-        pass
+async def build_user_payment_history_text(user_id: int) -> str:
+    payments = await storage.get_user_payments(user_id)
+    lines = ["📜 <b>История оплат</b>"]
+    if not payments:
+        lines.append("У вас ещё нет заявок на оплату.")
+        return "\n".join(lines)
+
+    status_map = {
+        "approved": "✅ Оплачено",
+        "pending": "⏳ Ожидает подтверждения",
+        "declined": "❌ Отклонено",
+    }
+    for payment in payments[:20]:
+        status = payment.get("status")
+        symbol = {"approved": "✅", "pending": "⏳", "declined": "❌"}.get(status, "•")
+        created = format_datetime(payment.get("created_at"))
+        lines.append(f"{symbol} {created} — {status_map.get(status, status)}")
+        if status == "approved":
+            resolved_at = payment.get("resolved_at")
+            if resolved_at:
+                try:
+                    expires_dt = datetime.fromisoformat(resolved_at) + timedelta(days=PAYMENT_VALID_DAYS)
+                    lines.append(f"     Активна до: {expires_dt.strftime('%d.%m.%Y')}")
+                except ValueError:
+                    pass
+        card_number = payment.get("card_number")
+        if card_number:
+            lines.append(f"     Карта: {card_number}")
+    return "\n".join(lines)
+
+
+async def build_admin_payments_text(limit: int = 50) -> str:
+    payments = await storage.get_all_payments()
+    if not payments:
+        return "📜 Пока нет заявок на оплату."
+
+    lines = ["📜 <b>Список оплат</b>"]
+    for payment in payments[:limit]:
+        status = payment.get("status")
+        symbol = {"approved": "✅", "pending": "⏳", "declined": "❌"}.get(status, "•")
+        created = format_datetime(payment.get("created_at"))
+        resolved_at = payment.get("resolved_at")
+        expires_text = ""
+        if status == "approved" and resolved_at:
+            try:
+                expires_dt = datetime.fromisoformat(resolved_at) + timedelta(days=PAYMENT_VALID_DAYS)
+                expires_text = f", до {expires_dt.strftime('%d.%m.%Y')}"
+            except ValueError:
+                pass
+        full_name = payment.get("full_name") or "—"
+        username = payment.get("username")
+        user_display = full_name
+        if username:
+            user_display += f" (@{username})"
+        card_number = payment.get("card_number") or "—"
+        status_name = {
+            "approved": "оплачено",
+            "pending": "ожидает подтверждения",
+            "declined": "отклонено",
+        }.get(status, status)
+        lines.append(
+            f"{symbol} {user_display}\n"
+            f"     Карта: {card_number}\n"
+            f"     Статус: {status_name} ({created}{expires_text})"
+        )
+    return "\n".join(lines)
+
+
+async def build_main_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup, bool]:
+    is_admin = await is_admin_user(user_id)
+    text = WELCOME_TEXT_ADMIN if is_admin else WELCOME_TEXT_USER
+    return text, main_menu_keyboard(is_admin), is_admin
+
+
+async def send_main_menu(message: types.Message, *, edit: bool = False, user_id: Optional[int] = None) -> None:
+    uid = user_id or (message.from_user.id if message.from_user else message.chat.id)
+    text, keyboard, _ = await build_main_menu(uid)
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=keyboard)
+        except exceptions.MessageNotModified:
+            pass
+    else:
+        await message.answer(text, reply_markup=keyboard)
 
 
 async def show_auto_menu(message: types.Message, auto_data: dict) -> None:
@@ -185,7 +285,7 @@ async def show_auto_menu(message: types.Message, auto_data: dict) -> None:
 @dp.message_handler(commands=["start", "menu"], state="*")
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
     await state.finish()
-    await message.answer(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await send_main_menu(message)
 
 
 @dp.message_handler(commands=["cancel"], state="*")
@@ -194,24 +294,61 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
         return
     await state.finish()
     await message.answer("Действие отменено. Возвращаемся в меню.")
-    await message.answer(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await send_main_menu(message)
 
 
-@dp.message_handler(commands=["админ", "admin"], state="*")
-async def cmd_set_admin(message: types.Message, state: FSMContext) -> None:
+@dp.message_handler(commands=["history", "payments"], state="*")
+async def cmd_user_payments(message: types.Message, state: FSMContext) -> None:
     await state.finish()
-    user = message.from_user
-    if await is_admin_user(user.id):
-        await message.answer("Вы уже назначены администратором и будете получать уведомления.")
+    text = await build_user_payment_history_text(message.from_user.id)
+    await message.answer(text)
+    await send_main_menu(message)
+
+
+@dp.message_handler(commands=["payments_all"], state="*")
+async def cmd_admin_payments(message: types.Message, state: FSMContext) -> None:
+    await state.finish()
+    if not await is_admin_user(message.from_user.id):
+        await message.answer("Команда доступна только администраторам.")
         return
-    await storage.set_user_role(user.id, "admin")
-    await message.answer(
-        "Статус администратора активирован. Вы будете получать заявки на оплату и сможете подтверждать их."
-    )
+    text = await build_admin_payments_text()
+    await message.answer(text)
+    await send_main_menu(message)
+
+
+@dp.message_handler(commands=["админ"], state="*")
+async def cmd_admin_login_ru(message: types.Message, state: FSMContext) -> None:
+    await cmd_admin_login(message, state)
+
+
+@dp.message_handler(commands=["admin"], state="*")
+async def cmd_admin_login(message: types.Message, state: FSMContext) -> None:
+    await state.finish()
+    if await is_admin_user(message.from_user.id):
+        await message.answer("Вы уже авторизованы как администратор.")
+        await send_main_menu(message)
+        return
+    await AdminLoginStates.waiting_for_code.set()
+    await message.answer("Введите код администратора:")
+
+
+@dp.message_handler(state=AdminLoginStates.waiting_for_code, content_types=types.ContentTypes.TEXT)
+async def process_admin_code(message: types.Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    if code != ADMIN_INVITE_CODE:
+        await message.reply("Неверный код. Попробуйте снова или используйте /cancel.")
+        return
+    await storage.set_user_role(message.from_user.id, "admin")
+    await state.finish()
+    await message.answer("Статус администратора активирован.")
+    await send_main_menu(message)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:auto")
 async def cb_main_auto(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     auto_data = await storage.get_auto()
     await show_auto_menu(call.message, auto_data)
@@ -219,6 +356,9 @@ async def cb_main_auto(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "main:stats")
 async def cb_main_stats(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     auto = await storage.get_auto()
     stats = auto.get("stats") or {}
@@ -254,20 +394,25 @@ async def cb_main_stats(call: types.CallbackQuery) -> None:
         lines.append(last_error)
     else:
         lines.append("Ошибок не зафиксировано.")
-    await call.message.edit_text("\n".join(lines), reply_markup=main_menu_keyboard())
+    _, keyboard, _ = await build_main_menu(call.from_user.id)
+    await call.message.edit_text("\n".join(lines), reply_markup=keyboard)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:groups")
 async def cb_main_groups(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
     if not known:
+        text, keyboard, _ = await build_main_menu(call.from_user.id)
         await call.message.edit_text(
             "📋 Пока нет групп для рассылки.\n"
             "Добавьте бота в нужный чат и назначьте администратором, затем повторите попытку.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=keyboard,
         )
         return
     header = (
@@ -282,6 +427,9 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "main:settings")
 async def cb_main_settings(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     auto = await storage.get_auto()
     interval = auto.get("interval_minutes")
@@ -304,7 +452,8 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
         f"{payment_line}\n\n"
         f"Сообщение:\n{message_text}"
     )
-    await call.message.edit_text(text, reply_markup=main_menu_keyboard())
+    _, keyboard, _ = await build_main_menu(call.from_user.id)
+    await call.message.edit_text(text, reply_markup=keyboard)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:pay")
@@ -334,14 +483,39 @@ async def cb_main_pay(call: types.CallbackQuery, state: FSMContext) -> None:
     )
 
 
+@dp.callback_query_handler(lambda c: c.data == "main:user_payments")
+async def cb_main_user_payments(call: types.CallbackQuery) -> None:
+    await call.answer()
+    text = await build_user_payment_history_text(call.from_user.id)
+    _, keyboard, _ = await build_main_menu(call.from_user.id)
+    await call.message.edit_text(text, reply_markup=keyboard)
+
+
+@dp.callback_query_handler(lambda c: c.data == "main:admin_payments")
+async def cb_main_admin_payments(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    await call.answer()
+    text = await build_admin_payments_text()
+    _, keyboard, _ = await build_main_menu(call.from_user.id)
+    await call.message.edit_text(text, reply_markup=keyboard)
+
+
 @dp.callback_query_handler(lambda c: c.data == "auto:back")
 async def cb_auto_back(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
-    await show_main_menu(call.message)
+    await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
 
 
 @dp.callback_query_handler(lambda c: c.data == "auto:set_message")
 async def cb_auto_set_message(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     await AutoCampaignStates.waiting_for_message.set()
     await call.message.answer(
@@ -352,6 +526,10 @@ async def cb_auto_set_message(call: types.CallbackQuery, state: FSMContext) -> N
 
 @dp.message_handler(state=AutoCampaignStates.waiting_for_message, content_types=types.ContentTypes.TEXT)
 async def process_auto_message(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await message.reply("Доступно только администраторам.")
+        await state.finish()
+        return
     text = message.text.strip()
     if not text:
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
@@ -371,6 +549,9 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
 
 @dp.callback_query_handler(lambda c: c.data == "auto:set_interval")
 async def cb_auto_set_interval(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     await AutoCampaignStates.waiting_for_interval.set()
     await call.message.answer(
@@ -381,6 +562,10 @@ async def cb_auto_set_interval(call: types.CallbackQuery, state: FSMContext) -> 
 
 @dp.message_handler(state=AutoCampaignStates.waiting_for_interval)
 async def process_auto_interval(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await message.reply("Доступно только администраторам.")
+        await state.finish()
+        return
     content = message.text.strip()
     if not content.isdigit():
         await message.reply("Нужно целое число минут. Попробуйте ещё раз.")
@@ -464,14 +649,19 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
     if not known:
-        await call.message.answer(
-            "Список групп пуст. Добавьте бота в нужный чат и назначьте администратором,"
-            " затем повторите попытку."
+        _, keyboard, _ = await build_main_menu(call.from_user.id)
+        await call.message.edit_text(
+            "📋 Пока нет групп для рассылки.\n"
+            "Добавьте бота в нужный чат и назначьте администратором, затем повторите попытку.",
+            reply_markup=keyboard,
         )
         return
     text = (
@@ -486,6 +676,9 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data.startswith("group:"))
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     try:
         _, origin, action = call.data.split(":", maxsplit=2)
@@ -494,7 +687,7 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         return
     if action == "done":
         if origin == "main":
-            await call.message.edit_text(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+            await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
         else:
             auto_data = await storage.get_auto()
             await show_auto_menu(call.message, auto_data)
@@ -579,6 +772,9 @@ async def cb_payment_decision(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "auto:start")
 async def cb_auto_start(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     auto = await storage.get_auto()
     if not auto.get("message"):
@@ -605,6 +801,9 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "auto:stop")
 async def cb_auto_stop(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
     await call.answer()
     await storage.set_auto_enabled(False)
     auto_sender: AutoSender = call.bot["auto_sender"]
