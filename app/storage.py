@@ -190,6 +190,22 @@ class Storage:
                     latest = resolved_dt
             return latest
 
+    async def get_user_payments(self, user_id: int) -> List[Dict[str, Any]]:
+        async with self._lock:
+            payments = [
+                deepcopy(payment)
+                for payment in self._data.get("payments", {}).values()
+                if payment.get("user_id") == user_id
+            ]
+            payments.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+            return payments
+
+    async def get_all_payments(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            payments = [deepcopy(payment) for payment in self._data.get("payments", {}).values()]
+            payments.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+            return payments
+
     async def set_user_role(self, user_id: int, role: str) -> None:
         async with self._lock:
             self._data["sessions"][str(user_id)] = {

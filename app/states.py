@@ -9,3 +9,7 @@ class AutoCampaignStates(StatesGroup):
 class PaymentStates(StatesGroup):
     waiting_for_card_number = State()
     waiting_for_card_name = State()
+
+
+class AdminLoginStates(StatesGroup):
+    waiting_for_code = State()
