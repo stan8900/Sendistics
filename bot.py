@@ -29,14 +29,21 @@ if not BOT_TOKEN:
     raise RuntimeError("Missng BOT_TOKEN")
 
 storage_path_env = os.getenv("STORAGE_PATH")
+legacy_storage_path: Optional[Path] = None
 if storage_path_env:
     storage_path = Path(storage_path_env)
     if not storage_path.is_absolute():
         storage_path = (BASE_DIR / storage_path).resolve()
 else:
-    storage_path = BASE_DIR / "data" / "storage.json"
+    storage_path = (BASE_DIR / "data" / "storage.db").resolve()
 
-storage = Storage(storage_path)
+if storage_path.suffix == ".json":
+    legacy_storage_path = storage_path
+    storage_path = storage_path.with_suffix(".db")
+else:
+    legacy_storage_path = storage_path.with_suffix(".json")
+
+storage = Storage(storage_path, legacy_json_path=legacy_storage_path)
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
@@ -411,7 +418,7 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         text, keyboard, _ = await build_main_menu(call.from_user.id)
         await call.message.edit_text(
             "📋 Пока нет групп для рассылки.\n"
-            "Добавьте бота в нужный чат и назначьте администратором, затем повторите попытку.",
+            "Добавьте бота в нужный чат и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
@@ -660,7 +667,7 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
         _, keyboard, _ = await build_main_menu(call.from_user.id)
         await call.message.edit_text(
             "📋 Пока нет групп для рассылки.\n"
-            "Добавьте бота в нужный чат и назначьте администратором, затем повторите попытку.",
+            "Добавьте бота в нужный чат и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
@@ -820,7 +827,11 @@ async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
     if chat.type not in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
         return
     title = chat.title or chat.full_name or str(chat.id)
-    if new_status == types.ChatMemberStatus.ADMINISTRATOR:
+    if new_status in (
+        types.ChatMemberStatus.ADMINISTRATOR,
+        types.ChatMemberStatus.CREATOR,
+        types.ChatMemberStatus.MEMBER,
+    ):
         await storage.upsert_known_chat(chat.id, title)
         logger.info("Добавлен чат %s (%s)", chat.id, title)
     elif new_status in (
@@ -842,13 +853,17 @@ async def handle_group_text(message: types.Message) -> None:
         bot_id = me.id
         message.bot["bot_id"] = bot_id
     member = await message.bot.get_chat_member(chat.id, bot_id)
-    if member.is_chat_admin():
+    if member.status in (
+        types.ChatMemberStatus.ADMINISTRATOR,
+        types.ChatMemberStatus.CREATOR,
+        types.ChatMemberStatus.MEMBER,
+    ):
         await storage.upsert_known_chat(chat.id, title_raw)
 
 
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
-    auto_sender = AutoSender(dispatcher.bot, storage, me.id, PAYMENT_VALID_DAYS)
+    auto_sender = AutoSender(dispatcher.bot, storage, PAYMENT_VALID_DAYS)
     dispatcher.bot["auto_sender"] = auto_sender
     dispatcher.bot["bot_id"] = me.id
     await storage.ensure_constraints()

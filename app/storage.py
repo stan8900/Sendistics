@@ -1,101 +1,110 @@
 import asyncio
 import json
-from copy import deepcopy
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+
 class Storage:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, legacy_json_path: Optional[Path] = None) -> None:
         self._path = path
+        self._legacy_json = legacy_json_path or path.with_suffix(".json")
         self._lock = asyncio.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._data: Dict[str, Any] = {
-            "auto": {
-                "message": None,
-                "interval_minutes": 60,
-                "target_chat_ids": [],
-                "is_enabled": False,
-                "stats": {
-                    "sent_total": 0,
-                    "last_sent_at": None,
-                    "last_error": None,
-                },
-            },
-            "known_chats": {},
-            "payments": {},
-            "sessions": {},
-        }
-        if self._path.exists():
-            self._load_sync()
-        else:
-            self._write_sync()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_db()
+        if (
+            self._legacy_json
+            and self._legacy_json != self._path
+            and self._legacy_json.exists()
+            and not self._has_any_data()
+        ):
+            self._migrate_from_json(self._legacy_json)
 
     async def get_data(self) -> Dict[str, Any]:
         async with self._lock:
-            return deepcopy(self._data)
+            return {
+                "auto": self._get_auto_locked(),
+                "known_chats": self._list_known_chats_locked(),
+                "payments": self._list_payments_locked(),
+                "sessions": self._list_sessions_locked(),
+            }
 
     async def get_auto(self) -> Dict[str, Any]:
         async with self._lock:
-            return deepcopy(self._data["auto"])
+            return self._get_auto_locked()
 
     async def set_auto_message(self, message: str) -> None:
         async with self._lock:
-            self._data["auto"]["message"] = message
-            await self._persist_locked()
+            self._conn.execute(
+                "UPDATE auto_config SET message = ? WHERE id = 1",
+                (message,),
+            )
+            self._conn.commit()
 
     async def set_auto_interval(self, minutes: int) -> None:
         async with self._lock:
-            self._data["auto"]["interval_minutes"] = minutes
-            await self._persist_locked()
+            self._conn.execute(
+                "UPDATE auto_config SET interval_minutes = ? WHERE id = 1",
+                (minutes,),
+            )
+            self._conn.commit()
 
     async def set_auto_enabled(self, enabled: bool) -> None:
         async with self._lock:
-            self._data["auto"]["is_enabled"] = enabled
-            await self._persist_locked()
+            self._conn.execute(
+                "UPDATE auto_config SET is_enabled = ? WHERE id = 1",
+                (1 if enabled else 0,),
+            )
+            self._conn.commit()
 
     async def toggle_target_chat(self, chat_id: int, title: Optional[str] = None) -> bool:
         async with self._lock:
-            targets: List[int] = list(self._data["auto"]["target_chat_ids"])
-            if chat_id in targets:
-                targets.remove(chat_id)
-                self._data["auto"]["target_chat_ids"] = targets
-                await self._persist_locked()
+            cur = self._conn.execute("SELECT 1 FROM auto_targets WHERE chat_id = ?", (chat_id,))
+            exists = cur.fetchone() is not None
+            if exists:
+                self._conn.execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
+                self._conn.commit()
                 return False
-            targets.append(chat_id)
-            self._data["auto"]["target_chat_ids"] = targets
+            self._conn.execute("INSERT OR IGNORE INTO auto_targets (chat_id) VALUES (?)", (chat_id,))
             if title:
                 self._ensure_known_chat_locked(chat_id, title)
-            await self._persist_locked()
+            self._conn.commit()
             return True
 
     async def update_stats(self, *, sent: int, errors: List[str]) -> None:
         async with self._lock:
-            stats = self._data["auto"]["stats"]
-            stats["sent_total"] = stats.get("sent_total", 0) + sent
-            stats["last_sent_at"] = datetime.utcnow().isoformat()
-            stats["last_error"] = "\n".join(errors) if errors else None
-            await self._persist_locked()
+            stats = self._conn.execute("SELECT sent_total FROM auto_stats WHERE id = 1").fetchone()
+            sent_total = (stats["sent_total"] if stats else 0) + sent
+            self._conn.execute(
+                "UPDATE auto_stats SET sent_total = ?, last_sent_at = ?, last_error = ? WHERE id = 1",
+                (
+                    sent_total,
+                    datetime.utcnow().isoformat(),
+                    "\n".join(errors) if errors else None,
+                ),
+            )
+            self._conn.commit()
 
     async def list_known_chats(self) -> Dict[str, Dict[str, Any]]:
         async with self._lock:
-            return deepcopy(self._data["known_chats"])
+            return self._list_known_chats_locked()
 
     async def upsert_known_chat(self, chat_id: int, title: str, *, ensure_target: bool = False) -> None:
         async with self._lock:
             self._ensure_known_chat_locked(chat_id, title)
-            if ensure_target and chat_id not in self._data["auto"]["target_chat_ids"]:
-                self._data["auto"]["target_chat_ids"].append(chat_id)
-            await self._persist_locked()
+            if ensure_target:
+                self._conn.execute("INSERT OR IGNORE INTO auto_targets (chat_id) VALUES (?)", (chat_id,))
+            self._conn.commit()
 
     async def remove_known_chat(self, chat_id: int) -> None:
         async with self._lock:
-            self._data["known_chats"].pop(str(chat_id), None)
-            targets = self._data["auto"]["target_chat_ids"]
-            if chat_id in targets:
-                targets.remove(chat_id)
-            await self._persist_locked()
+            self._conn.execute("DELETE FROM known_chats WHERE chat_id = ?", (chat_id,))
+            self._conn.execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
+            self._conn.commit()
 
     async def create_payment_request(
         self,
@@ -109,19 +118,16 @@ class Storage:
         async with self._lock:
             request_id = uuid4().hex
             created_at = datetime.utcnow().isoformat()
-            self._data["payments"][request_id] = {
-                "request_id": request_id,
-                "user_id": user_id,
-                "username": username,
-                "full_name": full_name,
-                "card_number": card_number,
-                "card_name": card_name,
-                "status": "pending",
-                "created_at": created_at,
-                "resolved_at": None,
-                "resolved_by": None,
-            }
-            await self._persist_locked()
+            self._conn.execute(
+                """
+                INSERT INTO payments (
+                    request_id, user_id, username, full_name,
+                    card_number, card_name, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (request_id, user_id, username, full_name, card_number, card_name, created_at),
+            )
+            self._conn.commit()
             return request_id
 
     async def set_payment_status(
@@ -133,137 +139,357 @@ class Storage:
         admin_username: Optional[str],
     ) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            payment = self._data["payments"].get(request_id)
-            if not payment:
+            row = self._conn.execute(
+                "SELECT request_id FROM payments WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if not row:
                 return None
-            payment = deepcopy(payment)
-            self._data["payments"][request_id]["status"] = status
-            self._data["payments"][request_id]["resolved_at"] = datetime.utcnow().isoformat()
-            self._data["payments"][request_id]["resolved_by"] = {
-                "admin_id": admin_id,
-                "admin_username": admin_username,
-            }
-            await self._persist_locked()
-            payment.update(self._data["payments"][request_id])
-            return payment
+            resolved_at = datetime.utcnow().isoformat()
+            self._conn.execute(
+                """
+                UPDATE payments
+                SET status = ?,
+                    resolved_at = ?,
+                    resolved_by_admin_id = ?,
+                    resolved_by_admin_username = ?
+                WHERE request_id = ?
+                """,
+                (status, resolved_at, admin_id, admin_username, request_id),
+            )
+            self._conn.commit()
+            return self._fetch_payment_locked(request_id)
 
     async def get_payment(self, request_id: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            payment = self._data["payments"].get(request_id)
-            return deepcopy(payment) if payment else None
+            return self._fetch_payment_locked(request_id)
 
     async def has_recent_payment(self, *, within_days: int) -> bool:
         async with self._lock:
-            payments = self._data.get("payments", {})
-            if not payments:
-                return False
             threshold = datetime.utcnow() - timedelta(days=max(0, within_days))
-            for payment in payments.values():
-                if (payment or {}).get("status") != "approved":
-                    continue
-                resolved_at = (payment or {}).get("resolved_at")
-                if not resolved_at:
-                    continue
-                try:
-                    resolved_dt = datetime.fromisoformat(resolved_at)
-                except ValueError:
-                    continue
-                if resolved_dt >= threshold:
-                    return True
-            return False
+            cur = self._conn.execute(
+                """
+                SELECT resolved_at FROM payments
+                WHERE status = 'approved' AND resolved_at IS NOT NULL
+                ORDER BY resolved_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not cur:
+                return False
+            try:
+                resolved_dt = datetime.fromisoformat(cur["resolved_at"])
+            except (TypeError, ValueError):
+                return False
+            return resolved_dt >= threshold
 
     async def latest_payment_timestamp(self) -> Optional[datetime]:
         async with self._lock:
-            payments = self._data.get("payments", {})
-            latest: Optional[datetime] = None
-            for payment in payments.values():
-                if (payment or {}).get("status") != "approved":
-                    continue
-                resolved_at = (payment or {}).get("resolved_at")
-                if not resolved_at:
-                    continue
-                try:
-                    resolved_dt = datetime.fromisoformat(resolved_at)
-                except ValueError:
-                    continue
-                if latest is None or resolved_dt > latest:
-                    latest = resolved_dt
-            return latest
+            cur = self._conn.execute(
+                """
+                SELECT resolved_at FROM payments
+                WHERE status = 'approved' AND resolved_at IS NOT NULL
+                ORDER BY resolved_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not cur or cur["resolved_at"] is None:
+                return None
+            try:
+                return datetime.fromisoformat(cur["resolved_at"])
+            except ValueError:
+                return None
 
     async def get_user_payments(self, user_id: int) -> List[Dict[str, Any]]:
         async with self._lock:
-            payments = [
-                deepcopy(payment)
-                for payment in self._data.get("payments", {}).values()
-                if payment.get("user_id") == user_id
-            ]
-            payments.sort(key=lambda item: item.get("created_at") or "", reverse=True)
-            return payments
+            rows = self._conn.execute(
+                "SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+            return [self._row_to_payment(row) for row in rows]
 
     async def get_all_payments(self) -> List[Dict[str, Any]]:
         async with self._lock:
-            payments = [deepcopy(payment) for payment in self._data.get("payments", {}).values()]
-            payments.sort(key=lambda item: item.get("created_at") or "", reverse=True)
-            return payments
+            rows = self._conn.execute(
+                "SELECT * FROM payments ORDER BY created_at DESC"
+            ).fetchall()
+            return [self._row_to_payment(row) for row in rows]
 
     async def set_user_role(self, user_id: int, role: str) -> None:
         async with self._lock:
-            self._data["sessions"][str(user_id)] = {
-                "role": role,
-                "updated_at": datetime.utcnow().isoformat(),
-            }
-            await self._persist_locked()
+            self._conn.execute(
+                """
+                INSERT INTO sessions (user_id, role, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, role, datetime.utcnow().isoformat()),
+            )
+            self._conn.commit()
 
     async def get_user_role(self, user_id: int) -> Optional[str]:
         async with self._lock:
-            session = self._data["sessions"].get(str(user_id))
-            if not session:
-                return None
-            return session.get("role")
+            row = self._conn.execute(
+                "SELECT role FROM sessions WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row["role"] if row else None
 
     async def list_admin_user_ids(self) -> List[int]:
         async with self._lock:
-            admin_ids = []
-            for key, session in self._data["sessions"].items():
-                if (session or {}).get("role") == "admin":
-                    try:
-                        admin_ids.append(int(key))
-                    except ValueError:
-                        continue
-            return admin_ids
+            rows = self._conn.execute(
+                "SELECT user_id FROM sessions WHERE role = 'admin'"
+            ).fetchall()
+            return [int(row["user_id"]) for row in rows]
 
     async def ensure_constraints(self) -> None:
-        """Disable autoresend if config is incomplete."""
         async with self._lock:
-            auto = self._data["auto"]
+            auto = self._get_auto_locked()
             if not auto["message"] or not auto["target_chat_ids"] or auto["interval_minutes"] <= 0:
-                auto["is_enabled"] = False
-                await self._persist_locked()
+                self._conn.execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
+                self._conn.commit()
 
-    def _ensure_known_chat_locked(self, chat_id: int, title: str) -> None:
-        key = str(chat_id)
-        sanitized_title = title.strip() if title else f"Чат {chat_id}"
-        self._data["known_chats"][key] = {
-            "chat_id": chat_id,
-            "title": sanitized_title,
+    def _get_auto_locked(self) -> Dict[str, Any]:
+        config = self._conn.execute(
+            "SELECT message, interval_minutes, is_enabled FROM auto_config WHERE id = 1"
+        ).fetchone()
+        stats = self._conn.execute(
+            "SELECT sent_total, last_sent_at, last_error FROM auto_stats WHERE id = 1"
+        ).fetchone()
+        targets = [
+            row["chat_id"]
+            for row in self._conn.execute(
+                "SELECT chat_id FROM auto_targets ORDER BY chat_id"
+            )
+        ]
+        auto = {
+            "message": config["message"] if config else None,
+            "interval_minutes": config["interval_minutes"] if config else 0,
+            "target_chat_ids": targets,
+            "is_enabled": bool(config["is_enabled"]) if config else False,
+            "stats": {
+                "sent_total": stats["sent_total"] if stats else 0,
+                "last_sent_at": stats["last_sent_at"] if stats else None,
+                "last_error": stats["last_error"] if stats else None,
+            },
+        }
+        return auto
+
+    def _list_known_chats_locked(self) -> Dict[str, Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT chat_id, title FROM known_chats ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+        return {
+            str(row["chat_id"]): {"chat_id": row["chat_id"], "title": row["title"]}
+            for row in rows
         }
 
-    async def _persist_locked(self) -> None:
-        data = deepcopy(self._data)
-        await asyncio.to_thread(self._write_sync_data, data)
+    def _list_payments_locked(self) -> Dict[str, Dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM payments").fetchall()
+        return {row["request_id"]: self._row_to_payment(row) for row in rows}
 
-    def _load_sync(self) -> None:
-        raw = self._path.read_text(encoding="utf-8")
-        if not raw.strip():
-            self._write_sync()
+    def _list_sessions_locked(self) -> Dict[str, Dict[str, Any]]:
+        rows = self._conn.execute("SELECT user_id, role, updated_at FROM sessions").fetchall()
+        return {
+            str(row["user_id"]): {"role": row["role"], "updated_at": row["updated_at"]}
+            for row in rows
+        }
+
+    def _ensure_known_chat_locked(self, chat_id: int, title: str) -> None:
+        sanitized_title = title.strip() if title else f"Чат {chat_id}"
+        self._conn.execute(
+            """
+            INSERT INTO known_chats (chat_id, title)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
+            """,
+            (chat_id, sanitized_title),
+        )
+
+    def _init_db(self) -> None:
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auto_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    message TEXT,
+                    interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    is_enabled INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auto_stats (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    sent_total INTEGER NOT NULL DEFAULT 0,
+                    last_sent_at TEXT,
+                    last_error TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS known_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auto_targets (
+                    chat_id INTEGER PRIMARY KEY,
+                    FOREIGN KEY(chat_id) REFERENCES known_chats(chat_id) ON DELETE CASCADE
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payments (
+                    request_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    full_name TEXT,
+                    card_number TEXT,
+                    card_name TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by_admin_id INTEGER,
+                    resolved_by_admin_username TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    user_id INTEGER PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO auto_config (id, interval_minutes, is_enabled) VALUES (1, 60, 0)"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO auto_stats (id, sent_total) VALUES (1, 0)"
+            )
+
+    def _has_any_data(self) -> bool:
+        cur = self._conn.execute("SELECT message, is_enabled FROM auto_config WHERE id = 1").fetchone()
+        if cur and (cur["message"] or cur["is_enabled"]):
+            return True
+        for table in ("known_chats", "auto_targets", "payments", "sessions"):
+            row = self._conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
+            if row and row["cnt"]:
+                return True
+        return False
+
+    def _migrate_from_json(self, legacy_path: Path) -> None:
+        try:
+            raw = legacy_path.read_text(encoding="utf-8")
+        except OSError:
             return
-        loaded = json.loads(raw)
-        self._data.update(loaded)
-        self._data.setdefault("payments", {})
-        self._data.setdefault("sessions", {})
+        if not raw.strip():
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        auto = data.get("auto") or {}
+        known = data.get("known_chats") or {}
+        payments = data.get("payments") or {}
+        sessions = data.get("sessions") or {}
+        with self._conn:
+            self._conn.execute(
+                "UPDATE auto_config SET message = ?, interval_minutes = ?, is_enabled = ? WHERE id = 1",
+                (
+                    auto.get("message"),
+                    auto.get("interval_minutes") or 0,
+                    1 if auto.get("is_enabled") else 0,
+                ),
+            )
+            stats = auto.get("stats") or {}
+            self._conn.execute(
+                "UPDATE auto_stats SET sent_total = ?, last_sent_at = ?, last_error = ? WHERE id = 1",
+                (
+                    stats.get("sent_total", 0),
+                    stats.get("last_sent_at"),
+                    stats.get("last_error"),
+                ),
+            )
+            targets: List[int] = list(auto.get("target_chat_ids") or [])
+            self._conn.execute("DELETE FROM auto_targets")
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO auto_targets (chat_id) VALUES (?)",
+                [(chat_id,) for chat_id in targets],
+            )
+            self._conn.execute("DELETE FROM known_chats")
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO known_chats (chat_id, title) VALUES (?, ?)",
+                [
+                    (
+                        int(chat_id),
+                        (info or {}).get("title") or f"Чат {chat_id}",
+                    )
+                    for chat_id, info in known.items()
+                ],
+            )
+            self._conn.execute("DELETE FROM payments")
+            self._conn.executemany(
+                """
+                INSERT INTO payments (
+                    request_id, user_id, username, full_name,
+                    card_number, card_name, status, created_at,
+                    resolved_at, resolved_by_admin_id, resolved_by_admin_username
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        req_id,
+                        (info or {}).get("user_id"),
+                        (info or {}).get("username"),
+                        (info or {}).get("full_name"),
+                        (info or {}).get("card_number"),
+                        (info or {}).get("card_name"),
+                        (info or {}).get("status", "pending"),
+                        (info or {}).get("created_at"),
+                        (info or {}).get("resolved_at"),
+                        ((info or {}).get("resolved_by") or {}).get("admin_id"),
+                        ((info or {}).get("resolved_by") or {}).get("admin_username"),
+                    )
+                    for req_id, info in payments.items()
+                ],
+            )
+            self._conn.execute("DELETE FROM sessions")
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO sessions (user_id, role, updated_at) VALUES (?, ?, ?)",
+                [
+                    (
+                        int(user_id),
+                        (info or {}).get("role") or "user",
+                        (info or {}).get("updated_at") or datetime.utcnow().isoformat(),
+                    )
+                    for user_id, info in sessions.items()
+                ],
+            )
 
-    def _write_sync(self) -> None:
-        self._path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _fetch_payment_locked(self, request_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM payments WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        return self._row_to_payment(row) if row else None
 
-    def _write_sync_data(self, data: Dict[str, Any]) -> None:
-        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _row_to_payment(self, row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        data["resolved_by"] = {
+            "admin_id": data.pop("resolved_by_admin_id"),
+            "admin_username": data.pop("resolved_by_admin_username"),
+        }
+        return data

@@ -1,17 +1,16 @@
 import asyncio
 from typing import List
 
-from aiogram import Bot, types
+from aiogram import Bot
 from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
 
 from .storage import Storage
 
 
 class AutoSender:
-    def __init__(self, bot: Bot, storage: Storage, bot_id: int, payment_valid_days: int) -> None:
+    def __init__(self, bot: Bot, storage: Storage, payment_valid_days: int) -> None:
         self._bot = bot
         self._storage = storage
-        self._bot_id = bot_id
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -74,9 +73,6 @@ class AutoSender:
             errors: List[str] = []
             for chat_id in targets:
                 try:
-                    if not await self._is_admin(chat_id):
-                        errors.append(f"Нет прав администратора в чате {chat_id}")
-                        continue
                     await self._bot.send_message(chat_id, message)
                     success += 1
                 except (BotKicked, ChatNotFound, Unauthorized) as exc:
@@ -106,10 +102,6 @@ class AutoSender:
                 return
             self._stop_event.clear()
             self._task = asyncio.create_task(self._run(), name="auto-sender")
-
-    async def _is_admin(self, chat_id: int) -> bool:
-        member: types.ChatMember = await self._bot.get_chat_member(chat_id, self._bot_id)
-        return member.is_chat_admin()
 
     async def _payments_ready(self) -> bool:
         if await self._storage.has_recent_payment(within_days=self._payment_valid_days):

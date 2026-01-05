@@ -8,6 +8,9 @@ __pycache__/
 # Environment configuration
 .env
 
+# Runtime databases
+data/*.db
+
 # VS Code/IDE
 .vscode/
 .idea/
