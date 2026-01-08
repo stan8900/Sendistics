@@ -880,4 +880,20 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
 
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=False, on_startup=on_startup, on_shutdown=on_shutdown)
+    retry_delay_raw = os.getenv("POLLING_RETRY_DELAY", "5")
+    try:
+        retry_delay = int(retry_delay_raw)
+    except ValueError:
+        retry_delay = 5
+    retry_delay = max(1, retry_delay)
+    while True:
+        try:
+            executor.start_polling(dp, skip_updates=False, on_startup=on_startup, on_shutdown=on_shutdown)
+            break
+        except exceptions.TerminatedByOtherGetUpdates:
+            logger.warning(
+                "Получен сигнал о другом активном getUpdates. Ждём %s c и пробуем снова.",
+                retry_delay,
+            )
+            # Два инстанса могут короткое время пересекаться при деплое, поэтому просто ждём и пробуем ещё раз.
+            asyncio.run(asyncio.sleep(retry_delay))
