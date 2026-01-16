@@ -353,9 +353,6 @@ async def process_admin_code(message: types.Message, state: FSMContext) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "main:auto")
 async def cb_main_auto(call: types.CallbackQuery) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     auto_data = await storage.get_auto()
     await show_auto_menu(call.message, auto_data)
@@ -511,18 +508,12 @@ async def cb_main_admin_payments(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "auto:back")
 async def cb_auto_back(call: types.CallbackQuery) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
 
 
 @dp.callback_query_handler(lambda c: c.data == "auto:set_message")
 async def cb_auto_set_message(call: types.CallbackQuery, state: FSMContext) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     await AutoCampaignStates.waiting_for_message.set()
     await call.message.answer(
@@ -533,10 +524,6 @@ async def cb_auto_set_message(call: types.CallbackQuery, state: FSMContext) -> N
 
 @dp.message_handler(state=AutoCampaignStates.waiting_for_message, content_types=types.ContentTypes.TEXT)
 async def process_auto_message(message: types.Message, state: FSMContext) -> None:
-    if not await is_admin_user(message.from_user.id):
-        await message.reply("Доступно только администраторам.")
-        await state.finish()
-        return
     text = message.text.strip()
     if not text:
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
@@ -556,9 +543,6 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
 
 @dp.callback_query_handler(lambda c: c.data == "auto:set_interval")
 async def cb_auto_set_interval(call: types.CallbackQuery, state: FSMContext) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     await AutoCampaignStates.waiting_for_interval.set()
     await call.message.answer(
@@ -569,10 +553,6 @@ async def cb_auto_set_interval(call: types.CallbackQuery, state: FSMContext) -> 
 
 @dp.message_handler(state=AutoCampaignStates.waiting_for_interval)
 async def process_auto_interval(message: types.Message, state: FSMContext) -> None:
-    if not await is_admin_user(message.from_user.id):
-        await message.reply("Доступно только администраторам.")
-        await state.finish()
-        return
     content = message.text.strip()
     if not content.isdigit():
         await message.reply("Нужно целое число минут. Попробуйте ещё раз.")
@@ -656,9 +636,6 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
@@ -683,9 +660,6 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data.startswith("group:"))
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     try:
         _, origin, action = call.data.split(":", maxsplit=2)
@@ -779,9 +753,6 @@ async def cb_payment_decision(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "auto:start")
 async def cb_auto_start(call: types.CallbackQuery) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     auto = await storage.get_auto()
     if not auto.get("message"):
@@ -808,9 +779,6 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data == "auto:stop")
 async def cb_auto_stop(call: types.CallbackQuery) -> None:
-    if not await is_admin_user(call.from_user.id):
-        await call.answer("Доступно только администраторам.", show_alert=True)
-        return
     await call.answer()
     await storage.set_auto_enabled(False)
     auto_sender: AutoSender = call.bot["auto_sender"]

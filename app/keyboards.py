@@ -19,7 +19,10 @@ def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
         ]
     else:
         keyboard = [
-            [InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay")],
+            [
+                InlineKeyboardButton("⚒ Авторассылка", callback_data="main:auto"),
+                InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay"),
+            ],
             [InlineKeyboardButton("📜 История оплат", callback_data="main:user_payments")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
