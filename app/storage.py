@@ -183,6 +183,28 @@ class Storage:
                 return False
             return resolved_dt >= threshold
 
+    async def has_recent_payment_for_user(self, user_id: int, *, within_days: int) -> bool:
+        async with self._lock:
+            threshold = datetime.utcnow() - timedelta(days=max(0, within_days))
+            cur = self._conn.execute(
+                """
+                SELECT resolved_at FROM payments
+                WHERE status = 'approved'
+                  AND user_id = ?
+                  AND resolved_at IS NOT NULL
+                ORDER BY resolved_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if not cur or not cur["resolved_at"]:
+                return False
+            try:
+                resolved_dt = datetime.fromisoformat(cur["resolved_at"])
+            except (TypeError, ValueError):
+                return False
+            return resolved_dt >= threshold
+
     async def latest_payment_timestamp(self) -> Optional[datetime]:
         async with self._lock:
             cur = self._conn.execute(
@@ -200,6 +222,26 @@ class Storage:
             except ValueError:
                 return None
 
+    async def latest_payment_timestamp_for_user(self, user_id: int) -> Optional[datetime]:
+        async with self._lock:
+            cur = self._conn.execute(
+                """
+                SELECT resolved_at FROM payments
+                WHERE status = 'approved'
+                  AND user_id = ?
+                  AND resolved_at IS NOT NULL
+                ORDER BY resolved_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if not cur or cur["resolved_at"] is None:
+                return None
+            try:
+                return datetime.fromisoformat(cur["resolved_at"])
+            except ValueError:
+                return None
+
     async def get_user_payments(self, user_id: int) -> List[Dict[str, Any]]:
         async with self._lock:
             rows = self._conn.execute(
@@ -207,6 +249,32 @@ class Storage:
                 (user_id,),
             ).fetchall()
             return [self._row_to_payment(row) for row in rows]
+
+    async def get_latest_payment_for_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM payments
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            return self._row_to_payment(row) if row else None
+
+    async def find_user_id_by_username(self, username: str) -> Optional[int]:
+        async with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT user_id FROM payments
+                WHERE LOWER(username) = LOWER(?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (username,),
+            ).fetchone()
+            return int(row["user_id"]) if row else None
 
     async def get_all_payments(self) -> List[Dict[str, Any]]:
         async with self._lock:

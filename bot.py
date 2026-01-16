@@ -10,12 +10,13 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.utils import exceptions, executor
 from aiogram.utils.markdown import hbold, quote_html
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from dotenv import load_dotenv
 
 from app.auto_sender import AutoSender
 from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboard
-from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates
+from app.pdf_reports import build_payments_pdf
+from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
 from app.storage import Storage
 
 
@@ -172,6 +173,22 @@ def build_payment_admin_text(payment: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_user_payment_status_message(status: str, resolved_at: Optional[str]) -> str:
+    if status == "approved":
+        expires_text = ""
+        if resolved_at:
+            try:
+                resolved_dt = datetime.fromisoformat(resolved_at)
+                expires_dt = resolved_dt + timedelta(days=PAYMENT_VALID_DAYS)
+                expires_text = f" Оплата активна до {expires_dt.strftime('%d.%m.%Y')} включительно."
+            except ValueError:
+                expires_text = ""
+        return "✅ Администратор подтвердил оплату. Спасибо!" + expires_text
+    if status == "declined":
+        return "❌ Администратор отклонил оплату. Свяжитесь с поддержкой."
+    return "Статус оплаты обновлён."
+
+
 async def build_user_payment_history_text(user_id: int) -> str:
     payments = await storage.get_user_payments(user_id)
     lines = ["📜 <b>История оплат</b>"]
@@ -258,7 +275,7 @@ async def send_main_menu(message: types.Message, *, edit: bool = False, user_id:
         await message.answer(text, reply_markup=keyboard)
 
 
-async def show_auto_menu(message: types.Message, auto_data: dict) -> None:
+async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Optional[int] = None) -> None:
     status = "Активна ✅" if auto_data.get("is_enabled") else "Не запущена"
     message_preview_raw = auto_data.get("message") or "— не задано"
     if len(message_preview_raw) > 180:
@@ -268,13 +285,33 @@ async def show_auto_menu(message: types.Message, auto_data: dict) -> None:
         message_preview = message_preview[:177] + "..."
     interval = auto_data.get("interval_minutes") or 0
     targets = auto_data.get("target_chat_ids") or []
-    payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
+    system_payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
-    if payment_valid and latest_payment:
+    if system_payment_valid and latest_payment:
         expires_dt = latest_payment + timedelta(days=PAYMENT_VALID_DAYS)
-        payment_line = f"Оплата: действительна до {expires_dt.strftime('%d.%m.%Y')} ✅"
+        system_payment_line = f"Общая оплата: действительна до {expires_dt.strftime('%d.%m.%Y')} ✅"
     else:
-        payment_line = f"Оплата: требуется пополнение (каждые {PAYMENT_VALID_DAYS} дней)"
+        system_payment_line = f"Общая оплата: требуется пополнение (каждые {PAYMENT_VALID_DAYS} дней)"
+    payment_lines = []
+    is_admin = None
+    if user_id is not None:
+        is_admin = await is_admin_user(user_id)
+        personal_valid = await storage.has_recent_payment_for_user(user_id, within_days=PAYMENT_VALID_DAYS)
+        if personal_valid:
+            personal_ts = await storage.latest_payment_timestamp_for_user(user_id)
+            if personal_ts:
+                personal_expires = personal_ts + timedelta(days=PAYMENT_VALID_DAYS)
+                payment_lines.append(f"Ваша оплата: активна до {personal_expires.strftime('%d.%m.%Y')} ✅")
+            else:
+                payment_lines.append("Ваша оплата: подтверждена ✅")
+        else:
+            payment_lines.append(
+                "Ваша оплата: не найдена или просрочена. Пополните баланс и дождитесь подтверждения. "
+                "Если платеж уже был, попросите администратора нажать «🔁 Перепроверить оплату»."
+            )
+    if is_admin or user_id is None:
+        payment_lines.append(system_payment_line)
+    payment_line = "\n".join(payment_lines) if payment_lines else system_payment_line
     text = (
         f"🛠 {hbold('Авторассылка')}\n\n"
         f"Статус: {status}\n"
@@ -355,7 +392,7 @@ async def process_admin_code(message: types.Message, state: FSMContext) -> None:
 async def cb_main_auto(call: types.CallbackQuery) -> None:
     await call.answer()
     auto_data = await storage.get_auto()
-    await show_auto_menu(call.message, auto_data)
+    await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:stats")
@@ -506,6 +543,19 @@ async def cb_main_admin_payments(call: types.CallbackQuery) -> None:
     await call.message.edit_text(text, reply_markup=keyboard)
 
 
+@dp.callback_query_handler(lambda c: c.data == "main:manual_payment")
+async def cb_main_manual_payment(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    await call.answer()
+    await AdminManualPaymentStates.waiting_for_user.set()
+    await call.message.answer(
+        "Введите Telegram ID или @username пользователя, чтобы перепроверить оплату.\n"
+        "Используйте /cancel для отмены."
+    )
+
+
 @dp.callback_query_handler(lambda c: c.data == "auto:back")
 async def cb_auto_back(call: types.CallbackQuery) -> None:
     await call.answer()
@@ -572,6 +622,46 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
         "Параметры авторассылки обновлены.",
         reply_markup=auto_menu_keyboard(is_enabled=auto_data.get("is_enabled")),
     )
+
+
+@dp.message_handler(state=AdminManualPaymentStates.waiting_for_user, content_types=types.ContentTypes.TEXT)
+async def process_manual_payment_user(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await message.reply("Доступно только администраторам.")
+        await state.finish()
+        return
+    raw = (message.text or "").strip()
+    user_id: Optional[int] = None
+    if raw.startswith("@") and len(raw) > 1:
+        found = await storage.find_user_id_by_username(raw[1:])
+        if found:
+            user_id = found
+        else:
+            await message.reply(
+                "Не удалось найти пользователя по username. Укажите числовой Telegram ID или повторите попытку."
+            )
+            return
+    elif raw.isdigit():
+        user_id = int(raw)
+    if user_id is None:
+        await message.reply("Нужно указать Telegram ID (цифры) или @username. Попробуйте ещё раз.")
+        return
+    payment = await storage.get_latest_payment_for_user(user_id)
+    info_lines = [f"Перепроверка пользователя <code>{user_id}</code>."]
+    if payment:
+        info_lines.append(
+            f"Последний статус: {payment.get('status')} (создано {format_datetime(payment.get('created_at'))})"
+        )
+    else:
+        info_lines.append("Ранее оплаты не найдены.")
+    info_lines.append("Выберите результат перепроверки:")
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"manual_payment:approve:{user_id}"),
+        InlineKeyboardButton("❌ Не подтверждать", callback_data=f"manual_payment:decline:{user_id}"),
+    )
+    await state.finish()
+    await message.answer("\n".join(info_lines), reply_markup=keyboard)
 
 
 @dp.message_handler(state=PaymentStates.waiting_for_card_number, content_types=types.ContentTypes.TEXT)
@@ -671,7 +761,7 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
         else:
             auto_data = await storage.get_auto()
-            await show_auto_menu(call.message, auto_data)
+            await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
         return
     try:
         chat_id = int(action)
@@ -696,6 +786,55 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         reply_text,
         reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
     )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("manual_payment:"))
+async def cb_manual_payment_decision(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    try:
+        _, action, user_id_raw = call.data.split(":", maxsplit=2)
+        user_id = int(user_id_raw)
+    except (ValueError, TypeError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+    if action not in {"approve", "decline"}:
+        await call.answer("Неизвестное действие.", show_alert=True)
+        return
+    last_payment = await storage.get_latest_payment_for_user(user_id)
+    username = (last_payment or {}).get("username")
+    full_name = (last_payment or {}).get("full_name") or (username and f"@{username}") or f"Пользователь {user_id}"
+    card_number = (last_payment or {}).get("card_number") or "manual-check"
+    card_name = (last_payment or {}).get("card_name") or "Перепроверка"
+    request_id = await storage.create_payment_request(
+        user_id=user_id,
+        username=username,
+        full_name=full_name,
+        card_number=card_number,
+        card_name=card_name,
+    )
+    updated = await storage.set_payment_status(
+        request_id,
+        status="approved" if action == "approve" else "declined",
+        admin_id=call.from_user.id,
+        admin_username=call.from_user.username,
+    )
+    if not updated:
+        await call.answer("Не удалось обновить заявку.", show_alert=True)
+        return
+    status_message = build_user_payment_status_message(updated.get("status"), updated.get("resolved_at"))
+    user_id = updated.get("user_id")
+    try:
+        await bot.send_message(user_id, status_message)
+    except exceptions.TelegramAPIError as exc:
+        logger.error("Не удалось отправить уведомление пользователю %s: %s", user_id, exc)
+    admin_text = build_payment_admin_text(updated)
+    await call.message.edit_text("Перепроверка завершена:\n\n" + admin_text)
+    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
+    if auto_sender:
+        await auto_sender.refresh()
+    await call.answer("Решение сохранено.")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("payment:"))
@@ -728,19 +867,7 @@ async def cb_payment_decision(call: types.CallbackQuery) -> None:
     if not updated:
         await call.answer("Не удалось обновить заявку.", show_alert=True)
         return
-    if status == "approved":
-        expires_text = ""
-        resolved_at = updated.get("resolved_at")
-        if resolved_at:
-            try:
-                resolved_dt = datetime.fromisoformat(resolved_at)
-                expires_dt = resolved_dt + timedelta(days=PAYMENT_VALID_DAYS)
-                expires_text = f" Оплата активна до {expires_dt.strftime('%d.%m.%Y')} включительно."
-            except ValueError:
-                expires_text = ""
-        status_message = "✅ Администратор подтвердил оплату. Спасибо!" + expires_text
-    else:
-        status_message = "❌ Администратор отклонил оплату. Свяжитесь с поддержкой."
+    status_message = build_user_payment_status_message(status, updated.get("resolved_at"))
     user_id = updated.get("user_id")
     try:
         await bot.send_message(user_id, status_message)
@@ -749,6 +876,32 @@ async def cb_payment_decision(call: types.CallbackQuery) -> None:
     admin_text = build_payment_admin_text(updated)
     await call.message.edit_text(admin_text)
     await call.answer("Решение сохранено.")
+
+
+@dp.callback_query_handler(lambda c: c.data == "main:payments_pdf")
+async def cb_main_payments_pdf(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    await call.answer()
+    payments = await storage.get_all_payments()
+    if not payments:
+        await call.message.answer("Пока нет заявок на оплату.")
+        return
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    pdf_path = BASE_DIR / "data" / f"payments_{timestamp}.pdf"
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, build_payments_pdf, payments, pdf_path)
+    try:
+        await call.message.answer_document(
+            InputFile(str(pdf_path)),
+            caption="Отчёт по оплатам (PDF).",
+        )
+    finally:
+        try:
+            pdf_path.unlink()
+        except OSError:
+            pass
 
 
 @dp.callback_query_handler(lambda c: c.data == "auto:start")
@@ -764,6 +917,12 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
     if (auto.get("interval_minutes") or 0) <= 0:
         await call.message.answer("Неверный интервал. Укажите значение больше нуля.")
         return
+    if not await storage.has_recent_payment_for_user(call.from_user.id, within_days=PAYMENT_VALID_DAYS):
+        await call.message.answer(
+            "Для запуска авторассылки вам нужна подтверждённая оплата. "
+            "Если платёж уже был, попросите администратора нажать «🔁 Перепроверить оплату» и подтвердить его."
+        )
+        return
     if not await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS):
         await call.message.answer(
             f"Для запуска авторассылки необходимо актуальное пополнение баланса за последние {PAYMENT_VALID_DAYS} дней."
@@ -774,7 +933,7 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
     await auto_sender.ensure_running()
     await call.message.answer("Авторассылка запущена.")
     updated = await storage.get_auto()
-    await show_auto_menu(call.message, updated)
+    await show_auto_menu(call.message, updated, user_id=call.from_user.id)
 
 
 @dp.callback_query_handler(lambda c: c.data == "auto:stop")
@@ -785,7 +944,7 @@ async def cb_auto_stop(call: types.CallbackQuery) -> None:
     await auto_sender.stop()
     await call.message.answer("Авторассылка остановлена.")
     updated = await storage.get_auto()
-    await show_auto_menu(call.message, updated)
+    await show_auto_menu(call.message, updated, user_id=call.from_user.id)
 
 
 @dp.my_chat_member_handler()

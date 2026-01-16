@@ -15,7 +15,11 @@ def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📋 Выбрать группы", callback_data="main:groups"),
                 InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings"),
             ],
-            [InlineKeyboardButton("📜 Оплаты", callback_data="main:admin_payments")],
+            [
+                InlineKeyboardButton("📜 Оплаты", callback_data="main:admin_payments"),
+                InlineKeyboardButton("🔁 Перепроверить оплату", callback_data="main:manual_payment"),
+            ],
+            [InlineKeyboardButton("📄 PDF оплат", callback_data="main:payments_pdf")],
         ]
     else:
         keyboard = [

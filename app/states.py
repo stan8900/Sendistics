@@ -13,3 +13,7 @@ class PaymentStates(StatesGroup):
 
 class AdminLoginStates(StatesGroup):
     waiting_for_code = State()
+
+
+class AdminManualPaymentStates(StatesGroup):
+    waiting_for_user = State()
