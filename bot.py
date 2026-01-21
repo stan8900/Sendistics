@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -49,14 +50,21 @@ else:
 
 def create_storage() -> Storage:
     if database_url:
-        try:
-            logger.info("Используем PostgreSQL хранилище.")
-            return Storage(storage_path, legacy_json_path=legacy_storage_path, database_url=database_url)
-        except Exception:
-            logger.exception("Не удалось подключиться к PostgreSQL.")
-            if database_required:
-                raise
-            logger.warning("Переходим на локальную SQLite-базу по пути %s.", storage_path)
+        attempts = 5
+        for attempt in range(1, attempts + 1):
+            try:
+                logger.info("Используем PostgreSQL хранилище (попытка %s/%s).", attempt, attempts)
+                return Storage(storage_path, legacy_json_path=legacy_storage_path, database_url=database_url)
+            except Exception:
+                logger.exception("Не удалось подключиться к PostgreSQL (попытка %s).", attempt)
+                if attempt == attempts:
+                    if database_required:
+                        raise
+                    logger.warning("Переходим на локальную SQLite-базу по пути %s.", storage_path)
+                    break
+                wait_for = min(5, attempt)
+                logger.info("Повторяем подключение через %s c.", wait_for)
+                time.sleep(wait_for)
     return Storage(storage_path, legacy_json_path=legacy_storage_path)
 
 
