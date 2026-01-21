@@ -46,6 +46,22 @@ else:
     legacy_storage_path = storage_path.with_suffix(".json")
 
 storage = Storage(storage_path, legacy_json_path=legacy_storage_path)
+
+tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
+tg_user_api_hash = os.getenv("TG_USER_API_HASH")
+tg_user_session = os.getenv("TG_USER_SESSION")
+user_sender: Optional[UserSender]
+if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
+    try:
+        tg_user_api_id = int(tg_user_api_id_raw)
+    except ValueError:
+        logger.warning("TG_USER_API_ID должен быть числом. Пользовательская рассылка отключена.")
+        user_sender = None
+    else:
+        user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
+else:
+    user_sender = None
+
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
@@ -82,21 +98,6 @@ STATIC_ADMIN_IDS: Set[int] = {
 }
 
 ADMIN_INVITE_CODE = os.getenv("ADMIN_CODE", "TW13")
-
-tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
-tg_user_api_hash = os.getenv("TG_USER_API_HASH")
-tg_user_session = os.getenv("TG_USER_SESSION")
-user_sender: Optional[UserSender]
-if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
-    try:
-        tg_user_api_id = int(tg_user_api_id_raw)
-    except ValueError:
-        logger.warning("TG_USER_API_ID должен быть числом. Пользовательская рассылка отключена.")
-        user_sender = None
-    else:
-        user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
-else:
-    user_sender = None
 
 
 async def get_user_role(user_id: int) -> str:
