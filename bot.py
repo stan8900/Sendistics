@@ -30,27 +30,37 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Missng BOT_TOKEN")
 
-database_url = os.getenv("DATABASE_URL")
-storage_path: Optional[Path] = None
-legacy_storage_path: Optional[Path] = None
-if database_url:
-    logger.info("Используем PostgreSQL хранилище.")
+database_url = os.getenv("DATABASE_URL") or None
+database_required = os.getenv("DATABASE_URL_REQUIRED", "false").lower() in {"1", "true", "yes"}
+storage_path_env = os.getenv("STORAGE_PATH")
+if storage_path_env:
+    storage_path = Path(storage_path_env)
+    if not storage_path.is_absolute():
+        storage_path = (BASE_DIR / storage_path).resolve()
 else:
-    storage_path_env = os.getenv("STORAGE_PATH")
-    if storage_path_env:
-        storage_path = Path(storage_path_env)
-        if not storage_path.is_absolute():
-            storage_path = (BASE_DIR / storage_path).resolve()
-    else:
-        storage_path = (BASE_DIR / "data" / "storage.db").resolve()
+    storage_path = (BASE_DIR / "data" / "storage.db").resolve()
 
-    if storage_path.suffix == ".json":
-        legacy_storage_path = storage_path
-        storage_path = storage_path.with_suffix(".db")
-    else:
-        legacy_storage_path = storage_path.with_suffix(".json")
+if storage_path.suffix == ".json":
+    legacy_storage_path = storage_path
+    storage_path = storage_path.with_suffix(".db")
+else:
+    legacy_storage_path = storage_path.with_suffix(".json")
 
-storage = Storage(storage_path, legacy_json_path=legacy_storage_path, database_url=database_url)
+
+def create_storage() -> Storage:
+    if database_url:
+        try:
+            logger.info("Используем PostgreSQL хранилище.")
+            return Storage(storage_path, legacy_json_path=legacy_storage_path, database_url=database_url)
+        except Exception:
+            logger.exception("Не удалось подключиться к PostgreSQL.")
+            if database_required:
+                raise
+            logger.warning("Переходим на локальную SQLite-базу по пути %s.", storage_path)
+    return Storage(storage_path, legacy_json_path=legacy_storage_path)
+
+
+storage = create_storage()
 
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")

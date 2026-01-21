@@ -21,14 +21,15 @@ Telegram-бот помогает запускать и управлять авт
 
 2. Создайте `.env` в корне проекта и пропишите токен бота и параметры доступа:
 
-   ```env
-   BOT_TOKEN=ваш_telegram_token
-   # для продакшена: PostgreSQL на Railway, например
-   DATABASE_URL=postgresql://user:password@host:5432/dbname
-   # необязательный список Telegram ID, которым всегда приходят уведомления об оплатах
-   ADMIN_IDS=12345678,98765432
-   ADMIN_CODE=TW13
-   # путь до SQLite-файла с данными (используется, если DATABASE_URL не задан)
+```env
+BOT_TOKEN=ваш_telegram_token
+# для продакшена: PostgreSQL на Railway, например
+DATABASE_URL=postgresql://user:password@host:5432/dbname
+DATABASE_URL_REQUIRED=false
+# необязательный список Telegram ID, которым всегда приходят уведомления об оплатах
+ADMIN_IDS=12345678,98765432
+ADMIN_CODE=TW13
+# путь до SQLite-файла с данными (используется, если DATABASE_URL не задан)
    STORAGE_PATH=data/storage.db
    # опционально: данные персонального аккаунта, если рассылка должна идти от лица человека
    TG_USER_API_ID=123456
@@ -36,7 +37,7 @@ Telegram-бот помогает запускать и управлять авт
    TG_USER_SESSION=1AAgbC... (строка сессии из Telethon)
    ```
 
-   Если указать `DATABASE_URL`, бот подключится к PostgreSQL (например, Railway). При пустом значении переменной используется локальный SQLite-файл по пути `STORAGE_PATH` (по умолчанию `data/storage.db`).
+Если указать `DATABASE_URL`, бот подключится к PostgreSQL (например, Railway). При пустом значении переменной используется локальный SQLite-файл по пути `STORAGE_PATH` (по умолчанию `data/storage.db`). Переменная `DATABASE_URL_REQUIRED=true` отключает автоматический fallback на SQLite — пригодится на проде, где отсутствие БД должно приводить к ошибке.
 
    > При первом запуске данные мигрируют в SQLite. Если рядом лежит старый `storage.json`, он будет автоматически импортирован и больше не используется.
 
