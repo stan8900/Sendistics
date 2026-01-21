@@ -3,26 +3,70 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from uuid import uuid4
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - driver optional
+    psycopg = None
+    dict_row = None
 
 
 class Storage:
-    def __init__(self, path: Path, *, legacy_json_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        path: Optional[Path],
+        *,
+        legacy_json_path: Optional[Path] = None,
+        database_url: Optional[str] = None,
+    ) -> None:
         self._path = path
-        self._legacy_json = legacy_json_path or path.with_suffix(".json")
+        self._legacy_json = legacy_json_path
+        self._database_url = database_url
+        self._is_postgres = bool(database_url)
         self._lock = asyncio.Lock()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        if self._is_postgres:
+            if not database_url:
+                raise ValueError("DATABASE_URL must be provided for PostgreSQL storage.")
+            if psycopg is None:
+                raise RuntimeError("psycopg is required for PostgreSQL storage. Install psycopg[binary].")
+            self._conn = psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
+        else:
+            if path is None:
+                raise ValueError("Storage path is required when DATABASE_URL is not set.")
+            self._legacy_json = legacy_json_path or path.with_suffix(".json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
         self._init_db()
         if (
-            self._legacy_json
+            not self._is_postgres
+            and self._legacy_json
+            and self._path
             and self._legacy_json != self._path
             and self._legacy_json.exists()
             and not self._has_any_data()
         ):
             self._migrate_from_json(self._legacy_json)
+
+    def _prepare_query(self, query: str) -> str:
+        if not self._is_postgres:
+            return query
+        return query.replace("?", "%s")
+
+    def _execute(self, query: str, params: Sequence[Any] = ()) -> Any:
+        sql = self._prepare_query(query)
+        return self._conn.execute(sql, params)
+
+    def _executemany(self, query: str, seq_of_params: Iterable[Sequence[Any]]) -> Any:
+        sql = self._prepare_query(query)
+        return self._conn.executemany(sql, seq_of_params)
+
+    def _commit(self) -> None:
+        if not self._is_postgres:
+            self._conn.commit()
 
     async def get_data(self) -> Dict[str, Any]:
         async with self._lock:
@@ -39,47 +83,50 @@ class Storage:
 
     async def set_auto_message(self, message: str) -> None:
         async with self._lock:
-            self._conn.execute(
+            self._execute(
                 "UPDATE auto_config SET message = ? WHERE id = 1",
                 (message,),
             )
-            self._conn.commit()
+            self._commit()
 
     async def set_auto_interval(self, minutes: int) -> None:
         async with self._lock:
-            self._conn.execute(
+            self._execute(
                 "UPDATE auto_config SET interval_minutes = ? WHERE id = 1",
                 (minutes,),
             )
-            self._conn.commit()
+            self._commit()
 
     async def set_auto_enabled(self, enabled: bool) -> None:
         async with self._lock:
-            self._conn.execute(
+            self._execute(
                 "UPDATE auto_config SET is_enabled = ? WHERE id = 1",
                 (1 if enabled else 0,),
             )
-            self._conn.commit()
+            self._commit()
 
     async def toggle_target_chat(self, chat_id: int, title: Optional[str] = None) -> bool:
         async with self._lock:
-            cur = self._conn.execute("SELECT 1 FROM auto_targets WHERE chat_id = ?", (chat_id,))
+            cur = self._execute("SELECT 1 FROM auto_targets WHERE chat_id = ?", (chat_id,))
             exists = cur.fetchone() is not None
             if exists:
-                self._conn.execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
-                self._conn.commit()
+                self._execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
+                self._commit()
                 return False
-            self._conn.execute("INSERT OR IGNORE INTO auto_targets (chat_id) VALUES (?)", (chat_id,))
+            self._execute(
+                "INSERT INTO auto_targets (chat_id) VALUES (?) ON CONFLICT (chat_id) DO NOTHING",
+                (chat_id,),
+            )
             if title:
                 self._ensure_known_chat_locked(chat_id, title)
-            self._conn.commit()
+            self._commit()
             return True
 
     async def update_stats(self, *, sent: int, errors: List[str]) -> None:
         async with self._lock:
-            stats = self._conn.execute("SELECT sent_total FROM auto_stats WHERE id = 1").fetchone()
+            stats = self._execute("SELECT sent_total FROM auto_stats WHERE id = 1").fetchone()
             sent_total = (stats["sent_total"] if stats else 0) + sent
-            self._conn.execute(
+            self._execute(
                 "UPDATE auto_stats SET sent_total = ?, last_sent_at = ?, last_error = ? WHERE id = 1",
                 (
                     sent_total,
@@ -87,7 +134,7 @@ class Storage:
                     "\n".join(errors) if errors else None,
                 ),
             )
-            self._conn.commit()
+            self._commit()
 
     async def list_known_chats(self) -> Dict[str, Dict[str, Any]]:
         async with self._lock:
@@ -97,14 +144,17 @@ class Storage:
         async with self._lock:
             self._ensure_known_chat_locked(chat_id, title)
             if ensure_target:
-                self._conn.execute("INSERT OR IGNORE INTO auto_targets (chat_id) VALUES (?)", (chat_id,))
-            self._conn.commit()
+                self._execute(
+                    "INSERT INTO auto_targets (chat_id) VALUES (?) ON CONFLICT (chat_id) DO NOTHING",
+                    (chat_id,),
+                )
+            self._commit()
 
     async def remove_known_chat(self, chat_id: int) -> None:
         async with self._lock:
-            self._conn.execute("DELETE FROM known_chats WHERE chat_id = ?", (chat_id,))
-            self._conn.execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
-            self._conn.commit()
+            self._execute("DELETE FROM known_chats WHERE chat_id = ?", (chat_id,))
+            self._execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
+            self._commit()
 
     async def create_payment_request(
         self,
@@ -118,7 +168,7 @@ class Storage:
         async with self._lock:
             request_id = uuid4().hex
             created_at = datetime.utcnow().isoformat()
-            self._conn.execute(
+            self._execute(
                 """
                 INSERT INTO payments (
                     request_id, user_id, username, full_name,
@@ -127,7 +177,7 @@ class Storage:
                 """,
                 (request_id, user_id, username, full_name, card_number, card_name, created_at),
             )
-            self._conn.commit()
+            self._commit()
             return request_id
 
     async def set_payment_status(
@@ -139,14 +189,14 @@ class Storage:
         admin_username: Optional[str],
     ) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT request_id FROM payments WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
             if not row:
                 return None
             resolved_at = datetime.utcnow().isoformat()
-            self._conn.execute(
+            self._execute(
                 """
                 UPDATE payments
                 SET status = ?,
@@ -157,7 +207,7 @@ class Storage:
                 """,
                 (status, resolved_at, admin_id, admin_username, request_id),
             )
-            self._conn.commit()
+            self._commit()
             return self._fetch_payment_locked(request_id)
 
     async def get_payment(self, request_id: str) -> Optional[Dict[str, Any]]:
@@ -167,7 +217,7 @@ class Storage:
     async def has_recent_payment(self, *, within_days: int) -> bool:
         async with self._lock:
             threshold = datetime.utcnow() - timedelta(days=max(0, within_days))
-            cur = self._conn.execute(
+            cur = self._execute(
                 """
                 SELECT resolved_at FROM payments
                 WHERE status = 'approved' AND resolved_at IS NOT NULL
@@ -186,7 +236,7 @@ class Storage:
     async def has_recent_payment_for_user(self, user_id: int, *, within_days: int) -> bool:
         async with self._lock:
             threshold = datetime.utcnow() - timedelta(days=max(0, within_days))
-            cur = self._conn.execute(
+            cur = self._execute(
                 """
                 SELECT resolved_at FROM payments
                 WHERE status = 'approved'
@@ -207,7 +257,7 @@ class Storage:
 
     async def latest_payment_timestamp(self) -> Optional[datetime]:
         async with self._lock:
-            cur = self._conn.execute(
+            cur = self._execute(
                 """
                 SELECT resolved_at FROM payments
                 WHERE status = 'approved' AND resolved_at IS NOT NULL
@@ -224,7 +274,7 @@ class Storage:
 
     async def latest_payment_timestamp_for_user(self, user_id: int) -> Optional[datetime]:
         async with self._lock:
-            cur = self._conn.execute(
+            cur = self._execute(
                 """
                 SELECT resolved_at FROM payments
                 WHERE status = 'approved'
@@ -244,7 +294,7 @@ class Storage:
 
     async def get_user_payments(self, user_id: int) -> List[Dict[str, Any]]:
         async with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC",
                 (user_id,),
             ).fetchall()
@@ -252,7 +302,7 @@ class Storage:
 
     async def get_latest_payment_for_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 """
                 SELECT * FROM payments
                 WHERE user_id = ?
@@ -265,7 +315,7 @@ class Storage:
 
     async def find_user_id_by_username(self, username: str) -> Optional[int]:
         async with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 """
                 SELECT user_id FROM payments
                 WHERE LOWER(username) = LOWER(?)
@@ -278,14 +328,14 @@ class Storage:
 
     async def get_all_payments(self) -> List[Dict[str, Any]]:
         async with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT * FROM payments ORDER BY created_at DESC"
             ).fetchall()
             return [self._row_to_payment(row) for row in rows]
 
     async def set_user_role(self, user_id: int, role: str) -> None:
         async with self._lock:
-            self._conn.execute(
+            self._execute(
                 """
                 INSERT INTO sessions (user_id, role, updated_at)
                 VALUES (?, ?, ?)
@@ -295,11 +345,11 @@ class Storage:
                 """,
                 (user_id, role, datetime.utcnow().isoformat()),
             )
-            self._conn.commit()
+            self._commit()
 
     async def get_user_role(self, user_id: int) -> Optional[str]:
         async with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT role FROM sessions WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
@@ -307,7 +357,7 @@ class Storage:
 
     async def list_admin_user_ids(self) -> List[int]:
         async with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT user_id FROM sessions WHERE role = 'admin'"
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
@@ -317,19 +367,19 @@ class Storage:
             auto = self._get_auto_locked()
             targets_valid = bool(auto["target_chat_ids"]) or not require_targets
             if not auto["message"] or not targets_valid or auto["interval_minutes"] <= 0:
-                self._conn.execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
-                self._conn.commit()
+                self._execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
+                self._commit()
 
     def _get_auto_locked(self) -> Dict[str, Any]:
-        config = self._conn.execute(
+        config = self._execute(
             "SELECT message, interval_minutes, is_enabled FROM auto_config WHERE id = 1"
         ).fetchone()
-        stats = self._conn.execute(
+        stats = self._execute(
             "SELECT sent_total, last_sent_at, last_error FROM auto_stats WHERE id = 1"
         ).fetchone()
         targets = [
             row["chat_id"]
-            for row in self._conn.execute(
+            for row in self._execute(
                 "SELECT chat_id FROM auto_targets ORDER BY chat_id"
             )
         ]
@@ -347,8 +397,8 @@ class Storage:
         return auto
 
     def _list_known_chats_locked(self) -> Dict[str, Dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT chat_id, title FROM known_chats ORDER BY title COLLATE NOCASE"
+        rows = self._execute(
+            "SELECT chat_id, title FROM known_chats ORDER BY LOWER(title)"
         ).fetchall()
         return {
             str(row["chat_id"]): {"chat_id": row["chat_id"], "title": row["title"]}
@@ -356,11 +406,11 @@ class Storage:
         }
 
     def _list_payments_locked(self) -> Dict[str, Dict[str, Any]]:
-        rows = self._conn.execute("SELECT * FROM payments").fetchall()
+        rows = self._execute("SELECT * FROM payments").fetchall()
         return {row["request_id"]: self._row_to_payment(row) for row in rows}
 
     def _list_sessions_locked(self) -> Dict[str, Dict[str, Any]]:
-        rows = self._conn.execute("SELECT user_id, role, updated_at FROM sessions").fetchall()
+        rows = self._execute("SELECT user_id, role, updated_at FROM sessions").fetchall()
         return {
             str(row["user_id"]): {"role": row["role"], "updated_at": row["updated_at"]}
             for row in rows
@@ -368,7 +418,7 @@ class Storage:
 
     def _ensure_known_chat_locked(self, chat_id: int, title: str) -> None:
         sanitized_title = title.strip() if title else f"Чат {chat_id}"
-        self._conn.execute(
+        self._execute(
             """
             INSERT INTO known_chats (chat_id, title)
             VALUES (?, ?)
@@ -378,83 +428,92 @@ class Storage:
         )
 
     def _init_db(self) -> None:
-        with self._conn:
-            self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auto_config (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    message TEXT,
-                    interval_minutes INTEGER NOT NULL DEFAULT 60,
-                    is_enabled INTEGER NOT NULL DEFAULT 0
-                )
-                """
+        if not self._is_postgres:
+            self._execute("PRAGMA foreign_keys = ON")
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                message TEXT,
+                interval_minutes INTEGER NOT NULL DEFAULT 60,
+                is_enabled INTEGER NOT NULL DEFAULT 0
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auto_stats (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    sent_total INTEGER NOT NULL DEFAULT 0,
-                    last_sent_at TEXT,
-                    last_error TEXT
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_stats (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                sent_total INTEGER NOT NULL DEFAULT 0,
+                last_sent_at TEXT,
+                last_error TEXT
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS known_chats (
-                    chat_id INTEGER PRIMARY KEY,
-                    title TEXT NOT NULL
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS known_chats (
+                chat_id BIGINT PRIMARY KEY,
+                title TEXT NOT NULL
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auto_targets (
-                    chat_id INTEGER PRIMARY KEY,
-                    FOREIGN KEY(chat_id) REFERENCES known_chats(chat_id) ON DELETE CASCADE
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_targets (
+                chat_id BIGINT PRIMARY KEY,
+                FOREIGN KEY(chat_id) REFERENCES known_chats(chat_id) ON DELETE CASCADE
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS payments (
-                    request_id TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    username TEXT,
-                    full_name TEXT,
-                    card_number TEXT,
-                    card_name TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    resolved_at TEXT,
-                    resolved_by_admin_id INTEGER,
-                    resolved_by_admin_username TEXT
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+                request_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                card_number TEXT,
+                card_name TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by_admin_id BIGINT,
+                resolved_by_admin_username TEXT
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    user_id INTEGER PRIMARY KEY,
-                    role TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                user_id BIGINT PRIMARY KEY,
+                role TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
-            self._conn.execute(
-                "INSERT OR IGNORE INTO auto_config (id, interval_minutes, is_enabled) VALUES (1, 60, 0)"
-            )
-            self._conn.execute(
-                "INSERT OR IGNORE INTO auto_stats (id, sent_total) VALUES (1, 0)"
-            )
+            """
+        )
+        self._execute(
+            """
+            INSERT INTO auto_config (id, interval_minutes, is_enabled)
+            VALUES (1, 60, 0)
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+        self._execute(
+            """
+            INSERT INTO auto_stats (id, sent_total)
+            VALUES (1, 0)
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+        self._commit()
 
     def _has_any_data(self) -> bool:
-        cur = self._conn.execute("SELECT message, is_enabled FROM auto_config WHERE id = 1").fetchone()
+        cur = self._execute("SELECT message, is_enabled FROM auto_config WHERE id = 1").fetchone()
         if cur and (cur["message"] or cur["is_enabled"]):
             return True
         for table in ("known_chats", "auto_targets", "payments", "sessions"):
-            row = self._conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
+            row = self._execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
             if row and row["cnt"]:
                 return True
         return False
@@ -474,33 +533,42 @@ class Storage:
         known = data.get("known_chats") or {}
         payments = data.get("payments") or {}
         sessions = data.get("sessions") or {}
-        with self._conn:
-            self._conn.execute(
-                "UPDATE auto_config SET message = ?, interval_minutes = ?, is_enabled = ? WHERE id = 1",
-                (
-                    auto.get("message"),
-                    auto.get("interval_minutes") or 0,
-                    1 if auto.get("is_enabled") else 0,
-                ),
-            )
-            stats = auto.get("stats") or {}
-            self._conn.execute(
-                "UPDATE auto_stats SET sent_total = ?, last_sent_at = ?, last_error = ? WHERE id = 1",
-                (
-                    stats.get("sent_total", 0),
-                    stats.get("last_sent_at"),
-                    stats.get("last_error"),
-                ),
-            )
-            targets: List[int] = list(auto.get("target_chat_ids") or [])
-            self._conn.execute("DELETE FROM auto_targets")
-            self._conn.executemany(
-                "INSERT OR IGNORE INTO auto_targets (chat_id) VALUES (?)",
+        self._execute(
+            "UPDATE auto_config SET message = ?, interval_minutes = ?, is_enabled = ? WHERE id = 1",
+            (
+                auto.get("message"),
+                auto.get("interval_minutes") or 0,
+                1 if auto.get("is_enabled") else 0,
+            ),
+        )
+        stats = auto.get("stats") or {}
+        self._execute(
+            "UPDATE auto_stats SET sent_total = ?, last_sent_at = ?, last_error = ? WHERE id = 1",
+            (
+                stats.get("sent_total", 0),
+                stats.get("last_sent_at"),
+                stats.get("last_error"),
+            ),
+        )
+        targets: List[int] = list(auto.get("target_chat_ids") or [])
+        self._execute("DELETE FROM auto_targets")
+        if targets:
+            self._executemany(
+                """
+                INSERT INTO auto_targets (chat_id)
+                VALUES (?)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
                 [(chat_id,) for chat_id in targets],
             )
-            self._conn.execute("DELETE FROM known_chats")
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO known_chats (chat_id, title) VALUES (?, ?)",
+        self._execute("DELETE FROM known_chats")
+        if known:
+            self._executemany(
+                """
+                INSERT INTO known_chats (chat_id, title)
+                VALUES (?, ?)
+                ON CONFLICT (chat_id) DO UPDATE SET title = excluded.title
+                """,
                 [
                     (
                         int(chat_id),
@@ -509,8 +577,9 @@ class Storage:
                     for chat_id, info in known.items()
                 ],
             )
-            self._conn.execute("DELETE FROM payments")
-            self._conn.executemany(
+        self._execute("DELETE FROM payments")
+        if payments:
+            self._executemany(
                 """
                 INSERT INTO payments (
                     request_id, user_id, username, full_name,
@@ -535,9 +604,16 @@ class Storage:
                     for req_id, info in payments.items()
                 ],
             )
-            self._conn.execute("DELETE FROM sessions")
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO sessions (user_id, role, updated_at) VALUES (?, ?, ?)",
+        self._execute("DELETE FROM sessions")
+        if sessions:
+            self._executemany(
+                """
+                INSERT INTO sessions (user_id, role, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+                """,
                 [
                     (
                         int(user_id),
@@ -547,15 +623,16 @@ class Storage:
                     for user_id, info in sessions.items()
                 ],
             )
+        self._commit()
 
     def _fetch_payment_locked(self, request_id: str) -> Optional[Dict[str, Any]]:
-        row = self._conn.execute(
+        row = self._execute(
             "SELECT * FROM payments WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         return self._row_to_payment(row) if row else None
 
-    def _row_to_payment(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _row_to_payment(self, row: Any) -> Dict[str, Any]:
         data = dict(row)
         data["resolved_by"] = {
             "admin_id": data.pop("resolved_by_admin_id"),
