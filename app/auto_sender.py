@@ -1,20 +1,29 @@
 import asyncio
-from typing import List
+from typing import List, Optional
 
 from aiogram import Bot
 from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
 
 from .storage import Storage
+from .user_sender import UserSender
 
 
 class AutoSender:
-    def __init__(self, bot: Bot, storage: Storage, payment_valid_days: int) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        storage: Storage,
+        payment_valid_days: int,
+        *,
+        user_sender: Optional[UserSender] = None,
+    ) -> None:
         self._bot = bot
         self._storage = storage
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
         self._payment_valid_days = max(0, payment_valid_days)
+        self._user_sender = user_sender
 
     async def start_if_enabled(self) -> None:
         auto = await self._storage.get_auto()
@@ -73,7 +82,10 @@ class AutoSender:
             errors: List[str] = []
             for chat_id in targets:
                 try:
-                    await self._bot.send_message(chat_id, message)
+                    if self._user_sender:
+                        await self._user_sender.send_message(chat_id, message)
+                    else:
+                        await self._bot.send_message(chat_id, message)
                     success += 1
                 except (BotKicked, ChatNotFound, Unauthorized) as exc:
                     errors.append(f"Недоступен чат {chat_id}: {exc}")

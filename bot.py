@@ -18,6 +18,7 @@ from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboar
 from app.pdf_reports import build_payments_pdf
 from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
 from app.storage import Storage
+from app.user_sender import UserSender
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
+bot["user_sender"] = user_sender
 
 WELCOME_TEXT_ADMIN = (
     "👋 Добро пожаловать обратно!\n\n"
@@ -80,6 +82,21 @@ STATIC_ADMIN_IDS: Set[int] = {
 }
 
 ADMIN_INVITE_CODE = os.getenv("ADMIN_CODE", "TW13")
+
+tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
+tg_user_api_hash = os.getenv("TG_USER_API_HASH")
+tg_user_session = os.getenv("TG_USER_SESSION")
+user_sender: Optional[UserSender]
+if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
+    try:
+        tg_user_api_id = int(tg_user_api_id_raw)
+    except ValueError:
+        logger.warning("TG_USER_API_ID должен быть числом. Пользовательская рассылка отключена.")
+        user_sender = None
+    else:
+        user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
+else:
+    user_sender = None
 
 
 async def get_user_role(user_id: int) -> str:
@@ -947,6 +964,15 @@ async def cb_auto_stop(call: types.CallbackQuery) -> None:
     await show_auto_menu(call.message, updated, user_id=call.from_user.id)
 
 
+@dp.message_handler(chat_type=[types.ChatType.PRIVATE], content_types=types.ContentTypes.ANY, state="*")
+async def handle_private_message_without_command(message: types.Message, state: FSMContext) -> None:
+    if await state.get_state():
+        return
+    if message.is_command():
+        return
+    await send_main_menu(message)
+
+
 @dp.my_chat_member_handler()
 async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
     new_status = update.new_chat_member.status
@@ -990,7 +1016,24 @@ async def handle_group_text(message: types.Message) -> None:
 
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
-    auto_sender = AutoSender(dispatcher.bot, storage, PAYMENT_VALID_DAYS)
+    user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
+    if user_sender_instance:
+        try:
+            await user_sender_instance.start()
+            identity = await user_sender_instance.describe_self()
+            logger.info("Пользовательская рассылка активирована от %s", identity)
+        except Exception:
+            logger.exception(
+                "Не удалось подключить пользовательскую сессию. Будем отправлять сообщения от имени бота."
+            )
+            user_sender_instance = None
+            dispatcher.bot["user_sender"] = None
+    auto_sender = AutoSender(
+        dispatcher.bot,
+        storage,
+        PAYMENT_VALID_DAYS,
+        user_sender=user_sender_instance,
+    )
     dispatcher.bot["auto_sender"] = auto_sender
     dispatcher.bot["bot_id"] = me.id
     await storage.ensure_constraints()
@@ -1002,6 +1045,9 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     auto_sender: Optional[AutoSender] = dispatcher.bot.get("auto_sender")
     if auto_sender:
         await auto_sender.stop()
+    user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
+    if user_sender_instance:
+        await user_sender_instance.stop()
     await dispatcher.storage.close()
     await dispatcher.storage.wait_closed()
 
