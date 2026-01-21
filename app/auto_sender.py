@@ -1,5 +1,6 @@
 import asyncio
-from typing import List, Optional
+import logging
+from typing import Dict, List, Optional
 
 from aiogram import Bot
 from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
@@ -24,6 +25,8 @@ class AutoSender:
         self._lock = asyncio.Lock()
         self._payment_valid_days = max(0, payment_valid_days)
         self._user_sender = user_sender
+        self._personal_chats: Dict[int, str] = {}
+        self._logger = logging.getLogger(__name__)
 
     async def start_if_enabled(self) -> None:
         auto = await self._storage.get_auto()
@@ -73,9 +76,14 @@ class AutoSender:
                 break
             message = auto.get("message")
             interval = int(auto.get("interval_minutes") or 0)
-            targets: List[int] = list(auto.get("target_chat_ids") or [])
+            targets: List[int]
+            if self._user_sender:
+                personal_chats = await self.get_personal_chats(refresh=True)
+                targets = list(personal_chats.keys())
+            else:
+                targets = list(auto.get("target_chat_ids") or [])
             if not message or not targets or interval <= 0:
-                await self._storage.ensure_constraints()
+                await self._storage.set_auto_enabled(False)
                 break
 
             success = 0
@@ -105,7 +113,10 @@ class AutoSender:
             self._stop_event.clear()
 
     async def _ensure_constraints(self, auto: dict) -> None:
-        if not auto.get("message") or not auto.get("target_chat_ids") or (auto.get("interval_minutes") or 0) <= 0:
+        has_message = bool(auto.get("message"))
+        interval_ok = (auto.get("interval_minutes") or 0) > 0
+        has_targets = await self._has_target_chats(auto)
+        if not (has_message and interval_ok and has_targets):
             await self._storage.set_auto_enabled(False)
 
     async def _start_background(self) -> None:
@@ -120,3 +131,38 @@ class AutoSender:
             return True
         await self._storage.set_auto_enabled(False)
         return False
+
+    async def get_personal_chats(self, *, refresh: bool = False) -> Dict[int, str]:
+        if not self._user_sender:
+            return {}
+        if refresh or not self._personal_chats:
+            await self._refresh_personal_chats()
+        return dict(self._personal_chats)
+
+    async def _refresh_personal_chats(self) -> None:
+        if not self._user_sender:
+            self._personal_chats = {}
+            return
+        try:
+            dialogs = await self._user_sender.list_accessible_chats()
+        except Exception:
+            self._logger.exception("Не удалось получить список групп личного аккаунта.")
+            return
+        personal = {chat_id: title for chat_id, title in dialogs}
+        existing = await self._storage.list_known_chats()
+        existing_ids = {int(chat_id) for chat_id in existing.keys()}
+        current_ids = set(personal.keys())
+        for chat_id, title in personal.items():
+            await self._storage.upsert_known_chat(chat_id, title)
+        for stale_id in existing_ids - current_ids:
+            await self._storage.remove_known_chat(stale_id)
+        self._personal_chats = personal
+
+    async def _has_target_chats(self, auto: dict) -> bool:
+        targets = auto.get("target_chat_ids") or []
+        if targets:
+            return True
+        if not self._user_sender:
+            return False
+        chats = await self.get_personal_chats(refresh=not self._personal_chats)
+        return bool(chats)

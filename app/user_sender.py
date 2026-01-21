@@ -1,10 +1,11 @@
 import asyncio
 import logging
-from typing import Union
+from typing import List, Tuple, Union
 
 from telethon import TelegramClient
 from telethon.errors import RPCError
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel, Chat
 
 
 ChatId = Union[int, str]
@@ -47,6 +48,19 @@ class UserSender:
         username = f"@{me.username}" if getattr(me, "username", None) else None
         full_name = " ".join(filter(None, [me.first_name, me.last_name])) or str(me.id)
         return f"{full_name} {username}" if username else full_name
+
+    async def list_accessible_chats(self) -> List[Tuple[int, str]]:
+        if not self._started:
+            await self.start()
+        chats: List[Tuple[int, str]] = []
+        async for dialog in self._client.iter_dialogs():
+            entity = dialog.entity
+            title = dialog.name or getattr(entity, "title", None) or getattr(entity, "username", None)
+            if isinstance(entity, Chat):
+                chats.append((entity.id, title or f"Чат {entity.id}"))
+            elif isinstance(entity, Channel) and not getattr(entity, "broadcast", False):
+                chats.append((entity.id, title or f"Чат {entity.id}"))
+        return chats
 
     async def stop(self) -> None:
         async with self._start_lock:

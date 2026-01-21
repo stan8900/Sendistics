@@ -3,18 +3,20 @@ from typing import Dict, Iterable, List
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+def main_menu_keyboard(is_admin: bool, *, allow_group_pick: bool) -> InlineKeyboardMarkup:
     if is_admin:
+        controls_row = [
+            InlineKeyboardButton("📊 Статистика", callback_data="main:stats"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings"),
+        ]
+        if allow_group_pick:
+            controls_row.insert(1, InlineKeyboardButton("📋 Выбрать группы", callback_data="main:groups"))
         keyboard = [
             [
                 InlineKeyboardButton("⚒ Авторассылка", callback_data="main:auto"),
                 InlineKeyboardButton("💰 Пополнить баланс", callback_data="main:pay"),
             ],
-            [
-                InlineKeyboardButton("📊 Статистика", callback_data="main:stats"),
-                InlineKeyboardButton("📋 Выбрать группы", callback_data="main:groups"),
-                InlineKeyboardButton("⚙️ Настройки", callback_data="main:settings"),
-            ],
+            controls_row,
             [
                 InlineKeyboardButton("📜 Оплаты", callback_data="main:admin_payments"),
                 InlineKeyboardButton("🔁 Перепроверить оплату", callback_data="main:manual_payment"),
@@ -32,12 +34,15 @@ def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def auto_menu_keyboard(*, is_enabled: bool) -> InlineKeyboardMarkup:
+def auto_menu_keyboard(*, is_enabled: bool, allow_group_pick: bool) -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("✏️ Сообщение", callback_data="auto:set_message"),
-         InlineKeyboardButton("⏱ Интервал", callback_data="auto:set_interval")],
-        [InlineKeyboardButton("👥 Группы", callback_data="auto:pick_groups")],
+        [
+            InlineKeyboardButton("✏️ Сообщение", callback_data="auto:set_message"),
+            InlineKeyboardButton("⏱ Интервал", callback_data="auto:set_interval"),
+        ]
     ]
+    if allow_group_pick:
+        keyboard.append([InlineKeyboardButton("👥 Группы", callback_data="auto:pick_groups")])
     toggle_label = "⏸ Остановить" if is_enabled else "▶️ Запустить"
     toggle_action = "auto:stop" if is_enabled else "auto:start"
     keyboard.append([InlineKeyboardButton(toggle_label, callback_data=toggle_action)])

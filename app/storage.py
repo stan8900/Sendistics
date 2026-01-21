@@ -312,10 +312,11 @@ class Storage:
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
 
-    async def ensure_constraints(self) -> None:
+    async def ensure_constraints(self, *, require_targets: bool = True) -> None:
         async with self._lock:
             auto = self._get_auto_locked()
-            if not auto["message"] or not auto["target_chat_ids"] or auto["interval_minutes"] <= 0:
+            targets_valid = bool(auto["target_chat_ids"]) or not require_targets
+            if not auto["message"] or not targets_valid or auto["interval_minutes"] <= 0:
                 self._conn.execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
                 self._conn.commit()
 

@@ -19,7 +19,6 @@ from app.pdf_reports import build_payments_pdf
 from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
 from app.storage import Storage
 from app.user_sender import UserSender
-from app.user_dialogs import UserDialogResponder
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -69,7 +68,6 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
 bot["user_sender"] = user_sender
-bot["user_dialog_responder"] = None
 
 PAYMENT_AMOUNT = 100_000
 PAYMENT_CURRENCY = "UZS"
@@ -83,7 +81,6 @@ PAYMENT_CARD_INVALID_MESSAGE = (
     f"{PAYMENT_CARD_PROMPT}"
 )
 PAYMENT_CARD_NAME_INVALID_MESSAGE = "Имя должно содержать минимум 3 символа. Попробуйте снова."
-PAYMENT_DIALOG_CANCEL_MESSAGE = "Действие отменено. Чтобы начать заново, просто напишите любое сообщение."
 PAYMENT_THANK_YOU_MESSAGE = (
     "Спасибо! Данные отправлены администратору. \n"
     f"После подтверждения оплата будет действовать {PAYMENT_VALID_DAYS} дней."
@@ -139,17 +136,6 @@ async def is_admin_user(user_id: int) -> bool:
 def format_currency(amount: int, currency: str) -> str:
     formatted = f"{amount:,}".replace(",", " ")
     return f"{formatted} {currency}"
-
-
-def build_user_session_welcome_text() -> str:
-    return (
-        f"{WELCOME_TEXT_USER}\n"
-        f"Для пополнения баланса: {PAYMENT_DESCRIPTION}.\n"
-        f"Сумма к оплате: {format_currency(PAYMENT_AMOUNT, PAYMENT_CURRENCY)}.\n\n"
-        f"После подтверждения оплата действует {PAYMENT_VALID_DAYS} дней.\n\n"
-        f"Переведите сумму на карту {PAYMENT_CARD_TARGET} и введите номер своей карты ниже.\n\n"
-        f"{PAYMENT_CARD_PROMPT}"
-    )
 
 
 def format_datetime(value: Optional[str]) -> str:
@@ -215,6 +201,13 @@ def build_payment_admin_text(payment: Dict[str, Any]) -> str:
         else:
             lines.append(f"Обработал ID: <code>{resolved_by.get('admin_id')}</code>")
     return "\n".join(lines)
+
+
+async def send_payment_status_to_user(user_id: int, text: str) -> None:
+    try:
+        await bot.send_message(user_id, text)
+    except exceptions.TelegramAPIError as exc:
+        logger.warning("Не удалось отправить уведомление пользователю %s через бота: %s", user_id, exc)
 
 
 async def notify_admins_about_payment(requester_id: int, request_id: str) -> None:
@@ -325,8 +318,9 @@ async def build_admin_payments_text(limit: int = 50) -> str:
 
 async def build_main_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup, bool]:
     is_admin = await is_admin_user(user_id)
+    allow_group_pick = bot.get("user_sender") is None
     text = WELCOME_TEXT_ADMIN if is_admin else WELCOME_TEXT_USER
-    return text, main_menu_keyboard(is_admin), is_admin
+    return text, main_menu_keyboard(is_admin, allow_group_pick=allow_group_pick), is_admin
 
 
 async def send_main_menu(message: types.Message, *, edit: bool = False, user_id: Optional[int] = None) -> None:
@@ -350,7 +344,17 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
     if len(message_preview) > 180:
         message_preview = message_preview[:177] + "..."
     interval = auto_data.get("interval_minutes") or 0
-    targets = auto_data.get("target_chat_ids") or []
+    allow_group_pick = message.bot.get("user_sender") is None
+    if allow_group_pick:
+        targets = auto_data.get("target_chat_ids") or []
+        group_line = f"Выбрано групп: {len(targets)}"
+    else:
+        auto_sender: Optional[AutoSender] = message.bot.get("auto_sender")
+        count = 0
+        if auto_sender:
+            personal_chats = await auto_sender.get_personal_chats(refresh=True)
+            count = len(personal_chats)
+        group_line = f"Групп пользователя: {count}"
     system_payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if system_payment_valid and latest_payment:
@@ -382,12 +386,18 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
         f"🛠 {hbold('Авторассылка')}\n\n"
         f"Статус: {status}\n"
         f"Интервал: {interval} мин\n"
-        f"Выбрано групп: {len(targets)}\n\n"
+        f"{group_line}\n\n"
         f"{payment_line}\n\n"
         f"Сообщение:\n{message_preview}"
     )
     try:
-        await message.edit_text(text, reply_markup=auto_menu_keyboard(is_enabled=auto_data.get("is_enabled")))
+        await message.edit_text(
+            text,
+            reply_markup=auto_menu_keyboard(
+                is_enabled=auto_data.get("is_enabled"),
+                allow_group_pick=allow_group_pick,
+            ),
+        )
     except exceptions.MessageNotModified:
         pass
 
@@ -510,6 +520,9 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
     if not await is_admin_user(call.from_user.id):
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
+    if call.bot.get("user_sender"):
+        await call.answer("Список групп формируется автоматически из чатов личного аккаунта.", show_alert=True)
+        return
     await call.answer()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
@@ -518,7 +531,7 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         text, keyboard, _ = await build_main_menu(call.from_user.id)
         await call.message.edit_text(
             "📋 Пока нет групп для рассылки.\n"
-            "Добавьте бота в нужный чат и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
+            "Добавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
@@ -542,8 +555,18 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
     interval = auto.get("interval_minutes")
     message_text_raw = auto.get("message") or "— не задано"
     message_text = quote_html(message_text_raw)
-    targets = auto.get("target_chat_ids") or []
     status = "Активна" if auto.get("is_enabled") else "Отключена"
+    allow_group_pick = call.bot.get("user_sender") is None
+    if allow_group_pick:
+        targets = auto.get("target_chat_ids") or []
+        group_line = f"Группы: {len(targets)} выбрано"
+    else:
+        auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
+        count = 0
+        if auto_sender:
+            personal_chats = await auto_sender.get_personal_chats(refresh=True)
+            count = len(personal_chats)
+        group_line = f"Группы пользователя: {count}"
     payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if payment_valid and latest_payment:
@@ -555,7 +578,7 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
         "⚙️ <b>Настройки рассылки</b>\n"
         f"Статус: {status}\n"
         f"Интервал: {interval} мин\n"
-        f"Группы: {len(targets)} выбрано\n"
+        f"{group_line}\n"
         f"{payment_line}\n\n"
         f"Сообщение:\n{message_text}"
     )
@@ -583,9 +606,8 @@ async def cb_main_pay(call: types.CallbackQuery, state: FSMContext) -> None:
         f"Для пополнения баланса: {PAYMENT_DESCRIPTION}.\n"
         f"Сумма к оплате: {format_currency(PAYMENT_AMOUNT, PAYMENT_CURRENCY)}.\n\n"
         f"После подтверждения оплата действует {PAYMENT_VALID_DAYS} дней.\n\n"
-        "Переведите сумму на карту <code>9860 1701 1433 3116</code> и введите номер своей карты ниже.\n\n"
-        "Введите номер карты (12–19 цифр).\n"
-        "Для отмены используйте /cancel.",
+        f"Переведите сумму на карту <code>{PAYMENT_CARD_TARGET}</code> и введите номер своей карты ниже.\n\n"
+        f"{PAYMENT_CARD_PROMPT}",
         disable_web_page_preview=True,
     )
 
@@ -645,7 +667,7 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
         return
     await storage.set_auto_message(text)
-    await storage.ensure_constraints()
+    await storage.ensure_constraints(require_targets=message.bot.get("user_sender") is None)
     auto_sender: AutoSender = message.bot["auto_sender"]
     await auto_sender.refresh()
     await state.finish()
@@ -653,7 +675,10 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
     auto_data = await storage.get_auto()
     await message.answer(
         "Параметры авторассылки обновлены.",
-        reply_markup=auto_menu_keyboard(is_enabled=auto_data.get("is_enabled")),
+        reply_markup=auto_menu_keyboard(
+            is_enabled=auto_data.get("is_enabled"),
+            allow_group_pick=message.bot.get("user_sender") is None,
+        ),
     )
 
 
@@ -678,7 +703,7 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
         await message.reply("Интервал должен быть больше нуля.")
         return
     await storage.set_auto_interval(minutes)
-    await storage.ensure_constraints()
+    await storage.ensure_constraints(require_targets=message.bot.get("user_sender") is None)
     auto_sender: AutoSender = message.bot["auto_sender"]
     await auto_sender.refresh()
     await state.finish()
@@ -686,7 +711,10 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
     auto_data = await storage.get_auto()
     await message.answer(
         "Параметры авторассылки обновлены.",
-        reply_markup=auto_menu_keyboard(is_enabled=auto_data.get("is_enabled")),
+        reply_markup=auto_menu_keyboard(
+            is_enabled=auto_data.get("is_enabled"),
+            allow_group_pick=message.bot.get("user_sender") is None,
+        ),
     )
 
 
@@ -734,22 +762,19 @@ async def process_manual_payment_user(message: types.Message, state: FSMContext)
 async def process_payment_card_number(message: types.Message, state: FSMContext) -> None:
     digits = "".join(filter(str.isdigit, message.text or ""))
     if len(digits) < 12 or len(digits) > 19:
-        await message.reply("Введите корректный номер карты (12–19 цифр).")
+        await message.reply(PAYMENT_CARD_INVALID_MESSAGE)
         return
     formatted = " ".join(digits[i : i + 4] for i in range(0, len(digits), 4))
     await state.update_data(card_number=formatted)
     await PaymentStates.waiting_for_card_name.set()
-    await message.answer(
-        "Укажите имя, как на карте.\n"
-        "Для отмены используйте /cancel."
-    )
+    await message.answer(PAYMENT_CARD_NAME_PROMPT)
 
 
 @dp.message_handler(state=PaymentStates.waiting_for_card_name, content_types=types.ContentTypes.TEXT)
 async def process_payment_card_name(message: types.Message, state: FSMContext) -> None:
     card_name = (message.text or "").strip()
     if len(card_name) < 3:
-        await message.reply("Имя должно содержать минимум 3 символа.")
+        await message.reply(PAYMENT_CARD_NAME_INVALID_MESSAGE)
         return
     data = await state.get_data()
     card_number = data.get("card_number")
@@ -772,6 +797,9 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
+    if call.bot.get("user_sender"):
+        await call.answer("Группы выбираются автоматически по списку личного аккаунта.", show_alert=True)
+        return
     await call.answer()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
@@ -779,8 +807,7 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     if not known:
         _, keyboard, _ = await build_main_menu(call.from_user.id)
         await call.message.edit_text(
-            "📋 Пока нет групп для рассылки.\n"
-            "Добавьте бота в нужный чат и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
+            "📋 Пока нет групп для рассылки.\nДобавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
@@ -796,6 +823,9 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data.startswith("group:"))
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
+    if call.bot.get("user_sender"):
+        await call.answer("В этом режиме список групп задаётся автоматически.", show_alert=True)
+        return
     await call.answer()
     try:
         _, origin, action = call.data.split(":", maxsplit=2)
@@ -818,7 +848,7 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
     title = quote_html(title_raw)
     selected = await storage.toggle_target_chat(chat_id, title_raw)
-    await storage.ensure_constraints()
+    await storage.ensure_constraints(require_targets=call.bot.get("user_sender") is None)
     auto_sender: AutoSender = call.bot["auto_sender"]
     await auto_sender.refresh()
     known = await storage.list_known_chats()
@@ -871,10 +901,7 @@ async def cb_manual_payment_decision(call: types.CallbackQuery) -> None:
         return
     status_message = build_user_payment_status_message(updated.get("status"), updated.get("resolved_at"))
     user_id = updated.get("user_id")
-    try:
-        await bot.send_message(user_id, status_message)
-    except exceptions.TelegramAPIError as exc:
-        logger.error("Не удалось отправить уведомление пользователю %s: %s", user_id, exc)
+    await send_payment_status_to_user(user_id, status_message)
     admin_text = build_payment_admin_text(updated)
     await call.message.edit_text("Перепроверка завершена:\n\n" + admin_text)
     auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
@@ -915,10 +942,7 @@ async def cb_payment_decision(call: types.CallbackQuery) -> None:
         return
     status_message = build_user_payment_status_message(status, updated.get("resolved_at"))
     user_id = updated.get("user_id")
-    try:
-        await bot.send_message(user_id, status_message)
-    except exceptions.TelegramAPIError as exc:
-        logger.error("Не удалось отправить уведомление пользователю %s: %s", user_id, exc)
+    await send_payment_status_to_user(user_id, status_message)
     admin_text = build_payment_admin_text(updated)
     await call.message.edit_text(admin_text)
     await call.answer("Решение сохранено.")
@@ -957,9 +981,19 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
     if not auto.get("message"):
         await call.message.answer("Сначала задайте текст сообщения.")
         return
-    if not auto.get("target_chat_ids"):
-        await call.message.answer("Не выбрано ни одной группы для рассылки.")
-        return
+    allow_group_pick = call.bot.get("user_sender") is None
+    if allow_group_pick:
+        if not auto.get("target_chat_ids"):
+            await call.message.answer("Не выбрано ни одной группы для рассылки.")
+            return
+    else:
+        auto_sender: AutoSender = call.bot["auto_sender"]
+        personal_chats = await auto_sender.get_personal_chats(refresh=True)
+        if not personal_chats:
+            await call.message.answer(
+                "Личный аккаунт не состоит ни в одной группе. Добавьте его в рабочие чаты и попробуйте снова."
+            )
+            return
     if (auto.get("interval_minutes") or 0) <= 0:
         await call.message.answer("Неверный интервал. Укажите значение больше нуля.")
         return
@@ -1048,34 +1082,17 @@ async def handle_group_text(message: types.Message) -> None:
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
     user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
-    user_dialog_instance: Optional[UserDialogResponder] = None
     if user_sender_instance:
         try:
             await user_sender_instance.start()
             identity = await user_sender_instance.describe_self()
             logger.info("Пользовательская рассылка активирована от %s", identity)
-            user_dialog_instance = UserDialogResponder(
-                user_sender_instance,
-                storage,
-                welcome_message=build_user_session_welcome_text(),
-                card_prompt_message=PAYMENT_CARD_PROMPT,
-                card_name_prompt=PAYMENT_CARD_NAME_PROMPT,
-                thank_you_message=PAYMENT_THANK_YOU_MESSAGE,
-                invalid_card_message=PAYMENT_CARD_INVALID_MESSAGE,
-                invalid_name_message=PAYMENT_CARD_NAME_INVALID_MESSAGE,
-                cancel_message=PAYMENT_DIALOG_CANCEL_MESSAGE,
-                payment_created_callback=notify_admins_about_payment,
-            )
-            await user_dialog_instance.start()
-            logger.info("Автоответы личного аккаунта включены.")
         except Exception:
             logger.exception(
                 "Не удалось подключить пользовательскую сессию. Будем отправлять сообщения от имени бота."
             )
             user_sender_instance = None
             dispatcher.bot["user_sender"] = None
-            user_dialog_instance = None
-    dispatcher.bot["user_dialog_responder"] = user_dialog_instance
     auto_sender = AutoSender(
         dispatcher.bot,
         storage,
@@ -1083,8 +1100,10 @@ async def on_startup(dispatcher: Dispatcher) -> None:
         user_sender=user_sender_instance,
     )
     dispatcher.bot["auto_sender"] = auto_sender
+    if user_sender_instance:
+        await auto_sender.get_personal_chats(refresh=True)
     dispatcher.bot["bot_id"] = me.id
-    await storage.ensure_constraints()
+    await storage.ensure_constraints(require_targets=dispatcher.bot.get("user_sender") is None)
     await auto_sender.start_if_enabled()
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
 
@@ -1093,9 +1112,6 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     auto_sender: Optional[AutoSender] = dispatcher.bot.get("auto_sender")
     if auto_sender:
         await auto_sender.stop()
-    user_dialog_instance: Optional[UserDialogResponder] = dispatcher.bot.get("user_dialog_responder")
-    if user_dialog_instance:
-        await user_dialog_instance.stop()
     user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
     if user_sender_instance:
         await user_sender_instance.stop()
