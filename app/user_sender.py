@@ -55,3 +55,6 @@ class UserSender:
             await self._client.disconnect()
             self._started = False
 
+    @property
+    def client(self) -> TelegramClient:
+        return self._client

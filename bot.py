@@ -19,6 +19,7 @@ from app.pdf_reports import build_payments_pdf
 from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
 from app.storage import Storage
 from app.user_sender import UserSender
+from app.user_dialogs import UserDialogResponder
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -68,6 +69,7 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
 bot["user_sender"] = user_sender
+bot["user_dialog_responder"] = None
 
 WELCOME_TEXT_ADMIN = (
     "👋 Добро пожаловать обратно!\n\n"
@@ -81,7 +83,7 @@ WELCOME_TEXT_ADMIN = (
 
 WELCOME_TEXT_USER = (
     "👋 Добро пожаловать!\n\n"
-    "💰 Пополнить баланс — отправьте данные оплаты на карту 9860 1701 1433 3116.\n"
+    f"💰 Пополнить баланс — отправьте данные оплаты на карту {PAYMENT_CARD_TARGET}.\n"
     "📜 История оплат — проверьте статус заявок и срок подписки.\n\n"
     "Если вы оператор, используйте команду /admin и введите код доступа."
 )
@@ -90,6 +92,19 @@ PAYMENT_AMOUNT = 100_000
 PAYMENT_CURRENCY = "UZS"
 PAYMENT_DESCRIPTION = "Оплата услуг логистического бота"
 PAYMENT_VALID_DAYS = 30
+PAYMENT_CARD_TARGET = "9860 1701 1433 3116"
+PAYMENT_CARD_PROMPT = "Введите номер карты (12–19 цифр).\nДля отмены используйте /cancel."
+PAYMENT_CARD_NAME_PROMPT = "Укажите имя, как на карте.\nДля отмены используйте /cancel."
+PAYMENT_CARD_INVALID_MESSAGE = (
+    "Номер карты должен содержать только 12–19 цифр. Пожалуйста, отправьте номер ещё раз.\n\n"
+    f"{PAYMENT_CARD_PROMPT}"
+)
+PAYMENT_CARD_NAME_INVALID_MESSAGE = "Имя должно содержать минимум 3 символа. Попробуйте снова."
+PAYMENT_DIALOG_CANCEL_MESSAGE = "Действие отменено. Чтобы начать заново, просто напишите любое сообщение."
+PAYMENT_THANK_YOU_MESSAGE = (
+    "Спасибо! Данные отправлены администратору. \n"
+    f"После подтверждения оплата будет действовать {PAYMENT_VALID_DAYS} дней."
+)
 
 STATIC_ADMIN_IDS: Set[int] = {
     int(admin_id.strip())
@@ -124,6 +139,17 @@ async def is_admin_user(user_id: int) -> bool:
 def format_currency(amount: int, currency: str) -> str:
     formatted = f"{amount:,}".replace(",", " ")
     return f"{formatted} {currency}"
+
+
+def build_user_session_welcome_text() -> str:
+    return (
+        f"{WELCOME_TEXT_USER}\n"
+        f"Для пополнения баланса: {PAYMENT_DESCRIPTION}.\n"
+        f"Сумма к оплате: {format_currency(PAYMENT_AMOUNT, PAYMENT_CURRENCY)}.\n\n"
+        f"После подтверждения оплата действует {PAYMENT_VALID_DAYS} дней.\n\n"
+        f"Переведите сумму на карту {PAYMENT_CARD_TARGET} и введите номер своей карты ниже.\n\n"
+        f"{PAYMENT_CARD_PROMPT}"
+    )
 
 
 def format_datetime(value: Optional[str]) -> str:
@@ -189,6 +215,28 @@ def build_payment_admin_text(payment: Dict[str, Any]) -> str:
         else:
             lines.append(f"Обработал ID: <code>{resolved_by.get('admin_id')}</code>")
     return "\n".join(lines)
+
+
+async def notify_admins_about_payment(requester_id: int, request_id: str) -> None:
+    payment = await storage.get_payment(request_id)
+    if not payment:
+        return
+    admin_text = build_payment_admin_text(payment)
+    admin_ids = await collect_admin_ids()
+    requester_is_admin = await is_admin_user(requester_id)
+    for admin_id in admin_ids:
+        if admin_id == requester_id and not requester_is_admin:
+            continue
+        if not await is_admin_user(admin_id):
+            continue
+        try:
+            await bot.send_message(
+                admin_id,
+                admin_text,
+                reply_markup=payment_admin_keyboard(request_id),
+            )
+        except exceptions.TelegramAPIError as exc:
+            logger.error("Не удалось уведомить админа %s: %s", admin_id, exc)
 
 
 def build_user_payment_status_message(status: str, resolved_at: Optional[str]) -> str:
@@ -710,7 +758,6 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
         await message.answer("Что-то пошло не так. Попробуйте снова начать оплату.")
         return
     user = message.from_user
-    user_role = await get_user_role(user.id)
     request_id = await storage.create_payment_request(
         user_id=user.id,
         username=user.username,
@@ -718,27 +765,8 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
         card_number=card_number,
         card_name=card_name,
     )
-    payment = await storage.get_payment(request_id)
-    if payment:
-        admin_text = build_payment_admin_text(payment)
-        admin_ids = await collect_admin_ids()
-        for admin_id in admin_ids:
-            if admin_id == user.id and user_role != "admin":
-                continue
-            if not await is_admin_user(admin_id):
-                continue
-            try:
-                await bot.send_message(
-                    admin_id,
-                    admin_text,
-                    reply_markup=payment_admin_keyboard(request_id),
-                )
-            except exceptions.TelegramAPIError as exc:
-                logger.error("Не удалось уведомить админа %s: %s", admin_id, exc)
-    await message.answer(
-        "Спасибо! Данные отправлены администратору. \n"
-        f"После подтверждения оплата будет действовать {PAYMENT_VALID_DAYS} дней."
-    )
+    await notify_admins_about_payment(user.id, request_id)
+    await message.answer(PAYMENT_THANK_YOU_MESSAGE)
     await state.finish()
 
 
@@ -965,11 +993,13 @@ async def cb_auto_stop(call: types.CallbackQuery) -> None:
     await show_auto_menu(call.message, updated, user_id=call.from_user.id)
 
 
-@dp.message_handler(chat_type=[types.ChatType.PRIVATE], content_types=types.ContentTypes.ANY, state="*")
+@dp.message_handler(
+    lambda message: message.chat.type == types.ChatType.PRIVATE and not (message.text or "").startswith("/"),
+    content_types=types.ContentTypes.ANY,
+    state="*",
+)
 async def handle_private_message_without_command(message: types.Message, state: FSMContext) -> None:
     if await state.get_state():
-        return
-    if message.is_command():
         return
     await send_main_menu(message)
 
@@ -1018,17 +1048,34 @@ async def handle_group_text(message: types.Message) -> None:
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
     user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
+    user_dialog_instance: Optional[UserDialogResponder] = None
     if user_sender_instance:
         try:
             await user_sender_instance.start()
             identity = await user_sender_instance.describe_self()
             logger.info("Пользовательская рассылка активирована от %s", identity)
+            user_dialog_instance = UserDialogResponder(
+                user_sender_instance,
+                storage,
+                welcome_message=build_user_session_welcome_text(),
+                card_prompt_message=PAYMENT_CARD_PROMPT,
+                card_name_prompt=PAYMENT_CARD_NAME_PROMPT,
+                thank_you_message=PAYMENT_THANK_YOU_MESSAGE,
+                invalid_card_message=PAYMENT_CARD_INVALID_MESSAGE,
+                invalid_name_message=PAYMENT_CARD_NAME_INVALID_MESSAGE,
+                cancel_message=PAYMENT_DIALOG_CANCEL_MESSAGE,
+                payment_created_callback=notify_admins_about_payment,
+            )
+            await user_dialog_instance.start()
+            logger.info("Автоответы личного аккаунта включены.")
         except Exception:
             logger.exception(
                 "Не удалось подключить пользовательскую сессию. Будем отправлять сообщения от имени бота."
             )
             user_sender_instance = None
             dispatcher.bot["user_sender"] = None
+            user_dialog_instance = None
+    dispatcher.bot["user_dialog_responder"] = user_dialog_instance
     auto_sender = AutoSender(
         dispatcher.bot,
         storage,
@@ -1046,6 +1093,9 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     auto_sender: Optional[AutoSender] = dispatcher.bot.get("auto_sender")
     if auto_sender:
         await auto_sender.stop()
+    user_dialog_instance: Optional[UserDialogResponder] = dispatcher.bot.get("user_dialog_responder")
+    if user_dialog_instance:
+        await user_dialog_instance.stop()
     user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
     if user_sender_instance:
         await user_sender_instance.stop()
