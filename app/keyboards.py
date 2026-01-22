@@ -58,14 +58,23 @@ def groups_keyboard(
 ) -> InlineKeyboardMarkup:
     selected_set = set(selected_ids)
     rows: List[List[InlineKeyboardButton]] = []
-    for chat_key, chat_info in sorted(known_chats.items(), key=lambda item: item[1].get("title", "")):
-        chat_id = int(chat_key)
+    sorted_items = [(int(chat_key), info) for chat_key, info in sorted(
+        known_chats.items(), key=lambda item: item[1].get("title", "")
+    )]
+    chat_ids = [chat_id for chat_id, _ in sorted_items]
+    all_selected = bool(chat_ids) and all(chat_id in selected_set for chat_id in chat_ids)
+    for chat_id, chat_info in sorted_items:
         title = chat_info.get("title") or f"Чат {chat_id}"
         prefix = "✅" if chat_id in selected_set else "➕"
         rows.append([
             InlineKeyboardButton(
                 f"{prefix} {title[:48]}", callback_data=f"group:{origin}:{chat_id}"
             )
+        ])
+    if chat_ids:
+        toggle_label = "➖ Снять выделение" if all_selected else "✅ Выбрать все"
+        rows.append([
+            InlineKeyboardButton(toggle_label, callback_data=f"group:{origin}:all")
         ])
     rows.append([
         InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")

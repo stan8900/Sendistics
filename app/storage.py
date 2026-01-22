@@ -156,6 +156,27 @@ class Storage:
             self._execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
             self._commit()
 
+    async def set_target_chats(self, chat_ids: Iterable[int]) -> None:
+        async with self._lock:
+            unique_ids: List[int] = []
+            seen = set()
+            for chat_id in chat_ids:
+                try:
+                    cid = int(chat_id)
+                except (TypeError, ValueError):
+                    continue
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                unique_ids.append(cid)
+            self._execute("DELETE FROM auto_targets")
+            if unique_ids:
+                self._executemany(
+                    "INSERT INTO auto_targets (chat_id) VALUES (?)",
+                    ((chat_id,) for chat_id in unique_ids),
+                )
+            self._commit()
+
     async def create_payment_request(
         self,
         *,

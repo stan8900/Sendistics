@@ -565,7 +565,8 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
     header = (
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопку, чтобы добавить или убрать чат.\n"
-        "Если ничего не выбрано, рассылка идёт во все доступные группы."
+        "Если ничего не выбрано, рассылка идёт во все доступные группы.\n"
+        "Используйте «Выбрать все», чтобы отметить все чаты сразу."
     )
     await call.message.edit_text(
         header,
@@ -845,7 +846,8 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     text = (
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопки, чтобы добавить или убрать чат.\n"
-        "Если ничего не выбрано, рассылка идёт во все доступные группы."
+        "Если ничего не выбрано, рассылка идёт во все доступные группы.\n"
+        "Используйте «Выбрать все», чтобы отметить все чаты сразу."
     )
     await call.message.edit_text(
         text,
@@ -872,23 +874,41 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             auto_data = await storage.get_auto()
             await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
         return
-    try:
-        chat_id = int(action)
-    except ValueError:
-        await call.answer("Некорректный идентификатор чата", show_alert=True)
-        return
     known = await storage.list_known_chats()
-    title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
-    title = quote_html(title_raw)
-    selected = await storage.toggle_target_chat(chat_id, title_raw)
+    update_message: str
+    if action == "all":
+        if not known:
+            await call.answer("Нет доступных чатов.", show_alert=True)
+            return
+        auto_data = await storage.get_auto()
+        available_ids = [int(chat_id) for chat_id in known.keys()]
+        known_set = set(available_ids)
+        current_targets = set(auto_data.get("target_chat_ids") or [])
+        select_all = bool(known_set) and known_set.issubset(current_targets)
+        if select_all:
+            await storage.set_target_chats([])
+            update_message = "Все чаты убраны из списка рассылки."
+        else:
+            await storage.set_target_chats(available_ids)
+            update_message = "Все доступные чаты добавлены в рассылку."
+    else:
+        try:
+            chat_id = int(action)
+        except ValueError:
+            await call.answer("Некорректный идентификатор чата", show_alert=True)
+            return
+        title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
+        title = quote_html(title_raw)
+        selected = await storage.toggle_target_chat(chat_id, title_raw)
+        update_message = f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}"
     await storage.ensure_constraints(require_targets=call.bot.get("user_sender") is None)
-    auto_sender: AutoSender = call.bot["auto_sender"]
-    await auto_sender.refresh()
+    auto_sender_instance: AutoSender = call.bot["auto_sender"]
+    await auto_sender_instance.refresh()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     reply_text = (
         "📋 <b>Выбор групп для рассылки</b>\n\n"
-        f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}\n"
+        f"{update_message}\n"
         "При необходимости выберите другие чаты или нажмите 'Готово'."
     )
     await call.message.edit_text(
