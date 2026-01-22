@@ -648,7 +648,10 @@ async def cb_main_user_payments(call: types.CallbackQuery) -> None:
     await call.answer()
     text = await build_user_payment_history_text(call.from_user.id)
     _, keyboard, _ = await build_main_menu(call.from_user.id)
-    await call.message.edit_text(text, reply_markup=keyboard)
+    try:
+        await call.message.edit_text(text, reply_markup=keyboard)
+    except exceptions.MessageNotModified:
+        pass
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:admin_payments")
@@ -659,7 +662,10 @@ async def cb_main_admin_payments(call: types.CallbackQuery) -> None:
     await call.answer()
     text = await build_admin_payments_text()
     _, keyboard, _ = await build_main_menu(call.from_user.id)
-    await call.message.edit_text(text, reply_markup=keyboard)
+    try:
+        await call.message.edit_text(text, reply_markup=keyboard)
+    except exceptions.MessageNotModified:
+        pass
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:manual_payment")

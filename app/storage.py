@@ -62,6 +62,13 @@ class Storage:
 
     def _executemany(self, query: str, seq_of_params: Iterable[Sequence[Any]]) -> Any:
         sql = self._prepare_query(query)
+        if self._is_postgres:
+            params_list = list(seq_of_params)
+            if not params_list:
+                return None
+            with self._conn.cursor() as cur:
+                cur.executemany(sql, params_list)
+                return cur
         return self._conn.executemany(sql, seq_of_params)
 
     def _commit(self) -> None:
