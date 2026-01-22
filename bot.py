@@ -73,6 +73,14 @@ storage = create_storage()
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
 tg_user_session = os.getenv("TG_USER_SESSION")
+tg_user_folder_names_raw = os.getenv("TG_USER_FOLDER_NAME") or os.getenv("TG_USER_FOLDER_NAMES")
+tg_user_folder_names: Optional[list[str]]
+if tg_user_folder_names_raw:
+    tg_user_folder_names = [name.strip() for name in tg_user_folder_names_raw.split(",") if name.strip()]
+    if not tg_user_folder_names:
+        tg_user_folder_names = None
+else:
+    tg_user_folder_names = None
 user_sender: Optional[UserSender]
 if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
     try:
@@ -81,7 +89,12 @@ if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
         logger.warning("TG_USER_API_ID должен быть числом. Пользовательская рассылка отключена.")
         user_sender = None
     else:
-        user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
+        user_sender = UserSender(
+            tg_user_api_id,
+            tg_user_api_hash,
+            tg_user_session,
+            allowed_folder_titles=tg_user_folder_names,
+        )
 else:
     user_sender = None
 
