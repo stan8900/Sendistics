@@ -69,8 +69,9 @@ class UserSender:
             await self.start()
         chats: List[Tuple[int, str]] = []
         allowed_folders = await self._resolve_folder_ids()
+        enforce_filter = bool(self._allowed_folder_titles)
         async for dialog in self._client.iter_dialogs():
-            if allowed_folders and dialog.folder_id not in allowed_folders:
+            if enforce_filter and dialog.folder_id not in allowed_folders:
                 continue
             entity = dialog.entity
             title = dialog.name or getattr(entity, "title", None) or getattr(entity, "username", None)
