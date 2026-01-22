@@ -341,7 +341,7 @@ async def build_admin_payments_text(limit: int = 50) -> str:
 
 async def build_main_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup, bool]:
     is_admin = await is_admin_user(user_id)
-    allow_group_pick = bot.get("user_sender") is None
+    allow_group_pick = True
     text = WELCOME_TEXT_ADMIN if is_admin else WELCOME_TEXT_USER
     return text, main_menu_keyboard(is_admin, allow_group_pick=allow_group_pick), is_admin
 
@@ -367,17 +367,19 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
     if len(message_preview) > 180:
         message_preview = message_preview[:177] + "..."
     interval = auto_data.get("interval_minutes") or 0
-    allow_group_pick = message.bot.get("user_sender") is None
-    if allow_group_pick:
-        targets = auto_data.get("target_chat_ids") or []
+    user_sender = message.bot.get("user_sender")
+    targets = auto_data.get("target_chat_ids") or []
+    if targets:
         group_line = f"Выбрано групп: {len(targets)}"
-    else:
+    elif user_sender:
         auto_sender: Optional[AutoSender] = message.bot.get("auto_sender")
         count = 0
         if auto_sender:
             personal_chats = await auto_sender.get_personal_chats(refresh=True)
             count = len(personal_chats)
-        group_line = f"Групп пользователя: {count}"
+        group_line = f"Группы личного аккаунта: {count} (используются все)"
+    else:
+        group_line = "Группы не выбраны"
     system_payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if system_payment_valid and latest_payment:
@@ -405,6 +407,7 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
     if is_admin or user_id is None:
         payment_lines.append(system_payment_line)
     payment_line = "\n".join(payment_lines) if payment_lines else system_payment_line
+    allow_group_pick = True
     text = (
         f"🛠 {hbold('Авторассылка')}\n\n"
         f"Статус: {status}\n"
@@ -543,10 +546,11 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
     if not await is_admin_user(call.from_user.id):
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
-    if call.bot.get("user_sender"):
-        await call.answer("Список групп формируется автоматически из чатов личного аккаунта.", show_alert=True)
-        return
     await call.answer()
+    user_sender = call.bot.get("user_sender")
+    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
+    if user_sender and auto_sender:
+        await auto_sender.get_personal_chats(refresh=True)
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
@@ -560,7 +564,8 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         return
     header = (
         "📋 <b>Выбор групп для рассылки</b>\n"
-        "Нажмите на кнопку, чтобы добавить или убрать чат."
+        "Нажмите на кнопку, чтобы добавить или убрать чат.\n"
+        "Если ничего не выбрано, рассылка идёт во все доступные группы."
     )
     await call.message.edit_text(
         header,
@@ -579,17 +584,19 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
     message_text_raw = auto.get("message") or "— не задано"
     message_text = quote_html(message_text_raw)
     status = "Активна" if auto.get("is_enabled") else "Отключена"
-    allow_group_pick = call.bot.get("user_sender") is None
-    if allow_group_pick:
-        targets = auto.get("target_chat_ids") or []
+    user_sender = call.bot.get("user_sender")
+    targets = auto.get("target_chat_ids") or []
+    if targets:
         group_line = f"Группы: {len(targets)} выбрано"
-    else:
+    elif user_sender:
         auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
         count = 0
         if auto_sender:
             personal_chats = await auto_sender.get_personal_chats(refresh=True)
             count = len(personal_chats)
-        group_line = f"Группы пользователя: {count}"
+        group_line = f"Группы личного аккаунта: {count} (используются все)"
+    else:
+        group_line = "Группы: не выбраны"
     payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if payment_valid and latest_payment:
@@ -700,7 +707,7 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
         "Параметры авторассылки обновлены.",
         reply_markup=auto_menu_keyboard(
             is_enabled=auto_data.get("is_enabled"),
-            allow_group_pick=message.bot.get("user_sender") is None,
+            allow_group_pick=True,
         ),
     )
 
@@ -736,7 +743,7 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
         "Параметры авторассылки обновлены.",
         reply_markup=auto_menu_keyboard(
             is_enabled=auto_data.get("is_enabled"),
-            allow_group_pick=message.bot.get("user_sender") is None,
+            allow_group_pick=True,
         ),
     )
 
@@ -820,10 +827,11 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
-    if call.bot.get("user_sender"):
-        await call.answer("Группы выбираются автоматически по списку личного аккаунта.", show_alert=True)
-        return
     await call.answer()
+    user_sender = call.bot.get("user_sender")
+    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
+    if user_sender and auto_sender:
+        await auto_sender.get_personal_chats(refresh=True)
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
@@ -836,7 +844,8 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
         return
     text = (
         "📋 <b>Выбор групп для рассылки</b>\n"
-        "Нажмите на кнопки, чтобы добавить или убрать чат."
+        "Нажмите на кнопки, чтобы добавить или убрать чат.\n"
+        "Если ничего не выбрано, рассылка идёт во все доступные группы."
     )
     await call.message.edit_text(
         text,
@@ -846,10 +855,11 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
 
 @dp.callback_query_handler(lambda c: c.data.startswith("group:"))
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
-    if call.bot.get("user_sender"):
-        await call.answer("В этом режиме список групп задаётся автоматически.", show_alert=True)
-        return
     await call.answer()
+    user_sender = call.bot.get("user_sender")
+    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
+    if user_sender and auto_sender:
+        await auto_sender.get_personal_chats(refresh=True)
     try:
         _, origin, action = call.data.split(":", maxsplit=2)
     except ValueError:
@@ -1004,18 +1014,27 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
     if not auto.get("message"):
         await call.message.answer("Сначала задайте текст сообщения.")
         return
-    allow_group_pick = call.bot.get("user_sender") is None
-    if allow_group_pick:
-        if not auto.get("target_chat_ids"):
-            await call.message.answer("Не выбрано ни одной группы для рассылки.")
-            return
-    else:
-        auto_sender: AutoSender = call.bot["auto_sender"]
+    user_sender = call.bot.get("user_sender")
+    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
+    selected_targets = auto.get("target_chat_ids") or []
+    if selected_targets and user_sender and auto_sender:
         personal_chats = await auto_sender.get_personal_chats(refresh=True)
-        if not personal_chats:
+        available_targets = [chat_id for chat_id in selected_targets if chat_id in personal_chats]
+        if not available_targets:
             await call.message.answer(
-                "Личный аккаунт не состоит ни в одной группе. Добавьте его в рабочие чаты и попробуйте снова."
+                "Ни один из выбранных чатов недоступен. Обновите список групп и попробуйте снова."
             )
+            return
+    elif not selected_targets:
+        if user_sender and auto_sender:
+            personal_chats = await auto_sender.get_personal_chats(refresh=True)
+            if not personal_chats:
+                await call.message.answer(
+                    "Личный аккаунт не состоит ни в одной группе. Добавьте его в рабочие чаты и попробуйте снова."
+                )
+                return
+        else:
+            await call.message.answer("Не выбрано ни одной группы для рассылки.")
             return
     if (auto.get("interval_minutes") or 0) <= 0:
         await call.message.answer("Неверный интервал. Укажите значение больше нуля.")

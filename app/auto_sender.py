@@ -77,11 +77,15 @@ class AutoSender:
             message = auto.get("message")
             interval = int(auto.get("interval_minutes") or 0)
             targets: List[int]
+            selected_targets = list(auto.get("target_chat_ids") or [])
             if self._user_sender:
                 personal_chats = await self.get_personal_chats(refresh=True)
-                targets = list(personal_chats.keys())
+                if selected_targets:
+                    targets = [chat_id for chat_id in selected_targets if chat_id in personal_chats]
+                else:
+                    targets = list(personal_chats.keys())
             else:
-                targets = list(auto.get("target_chat_ids") or [])
+                targets = selected_targets
             if not message or not targets or interval <= 0:
                 await self._storage.set_auto_enabled(False)
                 break
@@ -161,7 +165,10 @@ class AutoSender:
     async def _has_target_chats(self, auto: dict) -> bool:
         targets = auto.get("target_chat_ids") or []
         if targets:
-            return True
+            if not self._user_sender:
+                return True
+            chats = await self.get_personal_chats(refresh=not self._personal_chats)
+            return any(chat_id in chats for chat_id in targets)
         if not self._user_sender:
             return False
         chats = await self.get_personal_chats(refresh=not self._personal_chats)
