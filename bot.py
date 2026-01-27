@@ -70,6 +70,14 @@ def create_storage() -> Storage:
 
 storage = create_storage()
 
+
+async def safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
+    """Edit message but ignore Telegram 'message not modified' errors."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except exceptions.MessageNotModified:
+        return
+
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
 tg_user_session = os.getenv("TG_USER_SESSION")
@@ -376,10 +384,7 @@ async def send_main_menu(message: types.Message, *, edit: bool = False, user_id:
     uid = user_id or (message.from_user.id if message.from_user else message.chat.id)
     text, keyboard, _ = await build_main_menu(uid)
     if edit:
-        try:
-            await message.edit_text(text, reply_markup=keyboard)
-        except exceptions.MessageNotModified:
-            pass
+        await safe_edit_text(message, text, reply_markup=keyboard)
     else:
         await message.answer(text, reply_markup=keyboard)
 
@@ -442,16 +447,14 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
         f"{payment_line}\n\n"
         f"Сообщение:\n{message_preview}"
     )
-    try:
-        await message.edit_text(
-            text,
-            reply_markup=auto_menu_keyboard(
-                is_enabled=auto_data.get("is_enabled"),
-                allow_group_pick=allow_group_pick,
-            ),
-        )
-    except exceptions.MessageNotModified:
-        pass
+    await safe_edit_text(
+        message,
+        text,
+        reply_markup=auto_menu_keyboard(
+            is_enabled=auto_data.get("is_enabled"),
+            allow_group_pick=allow_group_pick,
+        ),
+    )
 
 
 @dp.message_handler(commands=["start", "menu"], state="*")
@@ -564,7 +567,7 @@ async def cb_main_stats(call: types.CallbackQuery) -> None:
     else:
         lines.append("Ошибок не зафиксировано.")
     _, keyboard, _ = await build_main_menu(call.from_user.id)
-    await call.message.edit_text("\n".join(lines), reply_markup=keyboard)
+    await safe_edit_text(call.message, "\n".join(lines), reply_markup=keyboard)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:groups")
@@ -582,7 +585,8 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
     selected = auto.get("target_chat_ids") or []
     if not known:
         text, keyboard, _ = await build_main_menu(call.from_user.id)
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             "📋 Пока нет групп для рассылки.\n"
             "Добавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
@@ -594,7 +598,8 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         "Если ничего не выбрано, рассылка идёт во все доступные группы.\n"
         "Используйте «Выбрать все», чтобы отметить все чаты сразу."
     )
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         header,
         reply_markup=groups_keyboard(known, selected, origin="main"),
     )
@@ -640,7 +645,7 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
         f"Сообщение:\n{message_text}"
     )
     _, keyboard, _ = await build_main_menu(call.from_user.id)
-    await call.message.edit_text(text, reply_markup=keyboard)
+    await safe_edit_text(call.message, text, reply_markup=keyboard)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:pay")
@@ -674,10 +679,7 @@ async def cb_main_user_payments(call: types.CallbackQuery) -> None:
     await call.answer()
     text = await build_user_payment_history_text(call.from_user.id)
     _, keyboard, _ = await build_main_menu(call.from_user.id)
-    try:
-        await call.message.edit_text(text, reply_markup=keyboard)
-    except exceptions.MessageNotModified:
-        pass
+    await safe_edit_text(call.message, text, reply_markup=keyboard)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:admin_payments")
@@ -688,10 +690,7 @@ async def cb_main_admin_payments(call: types.CallbackQuery) -> None:
     await call.answer()
     text = await build_admin_payments_text()
     _, keyboard, _ = await build_main_menu(call.from_user.id)
-    try:
-        await call.message.edit_text(text, reply_markup=keyboard)
-    except exceptions.MessageNotModified:
-        pass
+    await safe_edit_text(call.message, text, reply_markup=keyboard)
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:manual_payment")
@@ -870,7 +869,8 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     selected = auto.get("target_chat_ids") or []
     if not known:
         _, keyboard, _ = await build_main_menu(call.from_user.id)
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             "📋 Пока нет групп для рассылки.\nДобавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
@@ -881,7 +881,8 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
         "Если ничего не выбрано, рассылка идёт во все доступные группы.\n"
         "Используйте «Выбрать все», чтобы отметить все чаты сразу."
     )
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         text,
         reply_markup=groups_keyboard(known, selected, origin="auto"),
     )
@@ -943,7 +944,8 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         f"{update_message}\n"
         "При необходимости выберите другие чаты или нажмите 'Готово'."
     )
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         reply_text,
         reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
     )
@@ -988,7 +990,7 @@ async def cb_manual_payment_decision(call: types.CallbackQuery) -> None:
     user_id = updated.get("user_id")
     await send_payment_status_to_user(user_id, status_message)
     admin_text = build_payment_admin_text(updated)
-    await call.message.edit_text("Перепроверка завершена:\n\n" + admin_text)
+    await safe_edit_text(call.message, "Перепроверка завершена:\n\n" + admin_text)
     auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
     if auto_sender:
         await auto_sender.refresh()
@@ -1029,7 +1031,7 @@ async def cb_payment_decision(call: types.CallbackQuery) -> None:
     user_id = updated.get("user_id")
     await send_payment_status_to_user(user_id, status_message)
     admin_text = build_payment_admin_text(updated)
-    await call.message.edit_text(admin_text)
+    await safe_edit_text(call.message, admin_text)
     await call.answer("Решение сохранено.")
 
 
