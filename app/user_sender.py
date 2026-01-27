@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Awaitable, Callable, Iterable, List, Optional, Set, Tuple, TypeVar, Union
 
 from telethon import TelegramClient
 from telethon.errors import RPCError
@@ -10,6 +10,7 @@ from telethon.tl.types import Channel, Chat, DialogFilter
 
 
 ChatId = Union[int, str]
+T = TypeVar("T")
 
 
 class UserSender:
@@ -41,20 +42,23 @@ class UserSender:
         if allowed_chat_identifiers:
             for raw in allowed_chat_identifiers:
                 self._register_chat_identifier(raw)
+        self._retry_attempts = 3
+        self._retry_delay = 2.0
 
     async def start(self) -> None:
         await self._ensure_ready()
 
     async def send_message(self, chat_id: ChatId, message: str) -> None:
-        await self._ensure_ready()
-        try:
+        async def _send() -> None:
             await self._client.send_message(chat_id, message)
+
+        try:
+            await self._run_with_reconnect("отправить сообщение", _send)
         except RPCError as exc:
             raise RuntimeError(f"Не удалось отправить сообщение через пользовательский аккаунт: {exc}") from exc
 
     async def describe_self(self) -> str:
-        await self._ensure_ready()
-        me = await self._client.get_me()
+        me = await self._run_with_reconnect("получить данные профиля", self._client.get_me)
         if not me:
             return "неизвестный пользователь"
         username = f"@{me.username}" if getattr(me, "username", None) else None
@@ -62,23 +66,27 @@ class UserSender:
         return f"{full_name} {username}" if username else full_name
 
     async def list_accessible_chats(self) -> List[Tuple[int, str]]:
-        await self._ensure_ready()
-        chats: List[Tuple[int, str]] = []
-        allowed_folders = await self._resolve_folder_ids()
-        enforce_filter = bool(self._allowed_folder_titles)
-        enforce_chat_filter = bool(self._allowed_chat_ids or self._allowed_chat_usernames or self._allowed_chat_titles)
-        async for dialog in self._client.iter_dialogs():
-            if enforce_filter and dialog.folder_id not in allowed_folders:
-                continue
-            entity = dialog.entity
-            title = dialog.name or getattr(entity, "title", None) or getattr(entity, "username", None)
-            if enforce_chat_filter and not self._matches_chat_filter(entity, title):
-                continue
-            if isinstance(entity, Chat):
-                chats.append((entity.id, title or f"Чат {entity.id}"))
-            elif isinstance(entity, Channel) and not getattr(entity, "broadcast", False):
-                chats.append((entity.id, title or f"Чат {entity.id}"))
-        return chats
+        async def _collect() -> List[Tuple[int, str]]:
+            chats: List[Tuple[int, str]] = []
+            allowed_folders = await self._resolve_folder_ids()
+            enforce_filter = bool(self._allowed_folder_titles)
+            enforce_chat_filter = bool(
+                self._allowed_chat_ids or self._allowed_chat_usernames or self._allowed_chat_titles
+            )
+            async for dialog in self._client.iter_dialogs():
+                if enforce_filter and dialog.folder_id not in allowed_folders:
+                    continue
+                entity = dialog.entity
+                title = dialog.name or getattr(entity, "title", None) or getattr(entity, "username", None)
+                if enforce_chat_filter and not self._matches_chat_filter(entity, title):
+                    continue
+                if isinstance(entity, Chat):
+                    chats.append((entity.id, title or f"Чат {entity.id}"))
+                elif isinstance(entity, Channel) and not getattr(entity, "broadcast", False):
+                    chats.append((entity.id, title or f"Чат {entity.id}"))
+            return chats
+
+        return await self._run_with_reconnect("получить список чатов", _collect)
 
     async def _resolve_folder_ids(self) -> Set[int]:
         if not self._allowed_folder_titles:
@@ -185,7 +193,7 @@ class UserSender:
                 if not await self._client.is_user_authorized():
                     raise RuntimeError(
                         "Пользовательская сессия Telegram не авторизована. Заново сгенерируйте TG_USER_SESSION."
-                    )
+                )
                 self._started = True
                 return
             if not self._client.is_connected():
@@ -194,3 +202,39 @@ class UserSender:
                     raise RuntimeError(
                         "Пользовательская сессия Telegram не авторизована. Заново сгенерируйте TG_USER_SESSION."
                     )
+
+    async def _run_with_reconnect(self, action: str, func: Callable[[], Awaitable[T]]) -> T:
+        last_exc: Optional[ConnectionError] = None
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                await self._ensure_ready()
+                return await func()
+            except ConnectionError as exc:
+                last_exc = exc
+                if attempt >= self._retry_attempts:
+                    break
+                await self._handle_disconnect(exc, action, attempt)
+        if last_exc:
+            raise RuntimeError(f"Не удалось {action}: {last_exc}") from last_exc
+        raise RuntimeError(f"Не удалось {action}: неизвестная ошибка")
+
+    async def _handle_disconnect(self, exc: Exception, action: str, attempt: int) -> None:
+        delay = min(self._retry_delay * attempt, self._retry_delay * 3)
+        self._logger.warning(
+            "Не удалось %s через пользовательский аккаунт (попытка %s/%s): %s. Повторим через %.1f с.",
+            action,
+            attempt,
+            self._retry_attempts,
+            exc,
+            delay,
+        )
+        await self._reset_client_connection()
+        await asyncio.sleep(delay)
+
+    async def _reset_client_connection(self) -> None:
+        async with self._start_lock:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                self._logger.exception("Ошибка при отключении пользовательского аккаунта Telegram.")
+            self._started = False
