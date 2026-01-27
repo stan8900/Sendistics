@@ -189,11 +189,11 @@ class UserSender:
     async def _ensure_ready(self) -> None:
         async with self._start_lock:
             if not self._started:
-                await self._client.start()
+                await self._client.connect()
                 if not await self._client.is_user_authorized():
                     raise RuntimeError(
                         "Пользовательская сессия Telegram не авторизована. Заново сгенерируйте TG_USER_SESSION."
-                )
+                    )
                 self._started = True
                 return
             if not self._client.is_connected():
