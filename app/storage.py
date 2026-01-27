@@ -3,7 +3,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 from uuid import uuid4
 
 try:
@@ -147,9 +147,16 @@ class Storage:
         async with self._lock:
             return self._list_known_chats_locked()
 
-    async def upsert_known_chat(self, chat_id: int, title: str, *, ensure_target: bool = False) -> None:
+    async def upsert_known_chat(
+        self,
+        chat_id: int,
+        title: str,
+        *,
+        ensure_target: bool = False,
+        delivery_available: Optional[bool] = None,
+    ) -> None:
         async with self._lock:
-            self._ensure_known_chat_locked(chat_id, title)
+            self._ensure_known_chat_locked(chat_id, title, delivery_available=delivery_available)
             if ensure_target:
                 self._execute(
                     "INSERT INTO auto_targets (chat_id) VALUES (?) ON CONFLICT (chat_id) DO NOTHING",
@@ -162,6 +169,29 @@ class Storage:
             self._execute("DELETE FROM known_chats WHERE chat_id = ?", (chat_id,))
             self._execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
             self._commit()
+
+    async def set_delivery_available(self, chat_id: int, available: bool) -> None:
+        async with self._lock:
+            self._execute(
+                "UPDATE known_chats SET delivery_available = ? WHERE chat_id = ?",
+                (1 if available else 0, chat_id),
+            )
+            self._commit()
+
+    async def is_delivery_available(self, chat_id: int) -> bool:
+        async with self._lock:
+            row = self._execute(
+                "SELECT delivery_available FROM known_chats WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            return bool(row and row["delivery_available"])
+
+    async def list_delivery_ready_chat_ids(self) -> Set[int]:
+        async with self._lock:
+            rows = self._execute(
+                "SELECT chat_id FROM known_chats WHERE delivery_available = 1"
+            ).fetchall()
+            return {int(row["chat_id"]) for row in rows}
 
     async def set_target_chats(self, chat_ids: Iterable[int]) -> None:
         async with self._lock:
@@ -390,10 +420,10 @@ class Storage:
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
 
-    async def ensure_constraints(self, *, require_targets: bool = True) -> None:
+    async def ensure_constraints(self) -> None:
         async with self._lock:
             auto = self._get_auto_locked()
-            targets_valid = bool(auto["target_chat_ids"]) or not require_targets
+            targets_valid = bool(auto["target_chat_ids"])
             if not auto["message"] or not targets_valid or auto["interval_minutes"] <= 0:
                 self._execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
                 self._commit()
@@ -426,10 +456,14 @@ class Storage:
 
     def _list_known_chats_locked(self) -> Dict[str, Dict[str, Any]]:
         rows = self._execute(
-            "SELECT chat_id, title FROM known_chats ORDER BY LOWER(title)"
+            "SELECT chat_id, title, delivery_available FROM known_chats ORDER BY LOWER(title)"
         ).fetchall()
         return {
-            str(row["chat_id"]): {"chat_id": row["chat_id"], "title": row["title"]}
+            str(row["chat_id"]): {
+                "chat_id": row["chat_id"],
+                "title": row["title"],
+                "delivery_available": bool(row["delivery_available"]),
+            }
             for row in rows
         }
 
@@ -444,15 +478,33 @@ class Storage:
             for row in rows
         }
 
-    def _ensure_known_chat_locked(self, chat_id: int, title: str) -> None:
+    def _ensure_known_chat_locked(
+        self,
+        chat_id: int,
+        title: str,
+        *,
+        delivery_available: Optional[bool] = None,
+    ) -> None:
         sanitized_title = title.strip() if title else f"Чат {chat_id}"
+        if delivery_available is None:
+            self._execute(
+                """
+                INSERT INTO known_chats (chat_id, title)
+                VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
+                """,
+                (chat_id, sanitized_title),
+            )
+            return
         self._execute(
             """
-            INSERT INTO known_chats (chat_id, title)
-            VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
+            INSERT INTO known_chats (chat_id, title, delivery_available)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title = excluded.title,
+                delivery_available = excluded.delivery_available
             """,
-            (chat_id, sanitized_title),
+            (chat_id, sanitized_title, 1 if delivery_available else 0),
         )
 
     def _init_db(self) -> None:
@@ -520,6 +572,25 @@ class Storage:
             )
             """
         )
+        self._ensure_known_chats_schema()
+
+    def _ensure_known_chats_schema(self) -> None:
+        if self._is_postgres:
+            self._execute(
+                """
+                ALTER TABLE known_chats
+                ADD COLUMN IF NOT EXISTS delivery_available BOOLEAN NOT NULL DEFAULT FALSE
+                """
+            )
+            return
+        try:
+            self._execute(
+                "ALTER TABLE known_chats ADD COLUMN delivery_available INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError as exc:  # column already exists
+            message = str(exc).lower()
+            if "duplicate column name" not in message and "already exists" not in message:
+                raise
         self._execute(
             """
             INSERT INTO auto_config (id, interval_minutes, is_enabled)

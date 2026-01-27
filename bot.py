@@ -19,7 +19,6 @@ from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboar
 from app.pdf_reports import build_payments_pdf
 from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
 from app.storage import Storage
-from app.user_sender import UserSender
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -69,6 +68,7 @@ def create_storage() -> Storage:
 
 
 storage = create_storage()
+GROUP_CHAT_TYPES = {types.ChatType.GROUP, types.ChatType.SUPERGROUP}
 
 
 async def safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
@@ -77,54 +77,20 @@ async def safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
         await message.edit_text(text, **kwargs)
     except exceptions.MessageNotModified:
         return
-
-tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
-tg_user_api_hash = os.getenv("TG_USER_API_HASH")
-tg_user_session = os.getenv("TG_USER_SESSION")
-tgi_folder_raw = os.getenv("TG_USER_FOLDER_NAME") or os.getenv("TG_USER_FOLDER_NAMES")
-tg_user_folder_names: Optional[list[str]]
-if tgi_folder_raw:
-    tg_user_folder_names = [name.strip() for name in tgi_folder_raw.replace(";", ",").split(",") if name.strip()]
-    if not tg_user_folder_names:
-        tg_user_folder_names = None
-else:
-    tg_user_folder_names = None
-tg_user_allowed_chats_raw = os.getenv("TG_USER_ALLOWED_CHATS")
-tg_user_allowed_chats: Optional[list[str]]
-if tg_user_allowed_chats_raw:
-    delimiters = [",", "\n", ";"]
-    processed = tg_user_allowed_chats_raw
-    for delim in delimiters[1:]:
-        processed = processed.replace(delim, delimiters[0])
-    tg_user_allowed_chats = [item.strip() for item in processed.split(delimiters[0]) if item.strip()]
-    if not tg_user_allowed_chats:
-        tg_user_allowed_chats = None
-else:
-    tg_user_allowed_chats = None
-user_sender: Optional[UserSender]
-if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
-    try:
-        tg_user_api_id = int(tg_user_api_id_raw)
-    except ValueError:
-        logger.warning("TG_USER_API_ID должен быть числом. Пользовательская рассылка отключена.")
-        user_sender = None
-    else:
-        user_sender = UserSender(
-            tg_user_api_id,
-            tg_user_api_hash,
-            tg_user_session,
-            allowed_folder_titles=tg_user_folder_names,
-            allowed_chat_identifiers=tg_user_allowed_chats,
-        )
-else:
-    user_sender = None
-
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
+admin_bot_token = os.getenv("ADMIN_BOT_TOKEN")
+if admin_bot_token == BOT_TOKEN:
+    logger.warning("ADMIN_BOT_TOKEN совпадает с токеном основного бота, используем один экземпляр.")
+    admin_bot_token = None
+if admin_bot_token:
+    delivery_bot = Bot(token=admin_bot_token, parse_mode=types.ParseMode.HTML)
+else:
+    delivery_bot = bot
 dp = Dispatcher(bot, storage=MemoryStorage())
 
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
-bot["user_sender"] = user_sender
+bot["delivery_bot"] = delivery_bot
 
 PAYMENT_AMOUNT = 100_000
 PAYMENT_CURRENCY = "UZS"
@@ -398,19 +364,27 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
     if len(message_preview) > 180:
         message_preview = message_preview[:177] + "..."
     interval = auto_data.get("interval_minutes") or 0
-    user_sender = message.bot.get("user_sender")
     targets = auto_data.get("target_chat_ids") or []
+    known_chats = await storage.list_known_chats()
+    available_total = sum(1 for info in known_chats.values() if info.get("delivery_available"))
     if targets:
-        group_line = f"Выбрано групп: {len(targets)}"
-    elif user_sender:
-        auto_sender: Optional[AutoSender] = message.bot.get("auto_sender")
-        count = 0
-        if auto_sender:
-            personal_chats = await auto_sender.get_personal_chats(refresh=True)
-            count = len(personal_chats)
-        group_line = f"Группы личного аккаунта: {count} (используются все)"
+        missing = [
+            chat_id
+            for chat_id in targets
+            if str(chat_id) not in known_chats or not known_chats[str(chat_id)].get("delivery_available")
+        ]
+        if missing:
+            group_line = (
+                f"⚠️ Выбрано групп: {len(targets)}. "
+                "Добавьте бота-админа во все выбранные чаты."
+            )
+        else:
+            group_line = f"Выбрано групп: {len(targets)} из доступных {available_total}"
     else:
-        group_line = "Группы не выбраны"
+        if available_total:
+            group_line = f"Группы не выбраны (доступно {available_total})"
+        else:
+            group_line = "Нет доступных групп: добавьте бота-админа в рабочие чаты."
     system_payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if system_payment_valid and latest_payment:
@@ -576,10 +550,6 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
-    user_sender = call.bot.get("user_sender")
-    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-    if user_sender and auto_sender:
-        await auto_sender.get_personal_chats(refresh=True)
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
@@ -588,15 +558,15 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         await safe_edit_text(
             call.message,
             "📋 Пока нет групп для рассылки.\n"
-            "Добавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
+            "Добавьте бота-админа в рабочие чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
     header = (
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопку, чтобы добавить или убрать чат.\n"
-        "Если ничего не выбрано, рассылка идёт во все доступные группы.\n"
-        "Используйте «Выбрать все», чтобы отметить все чаты сразу."
+        "Используйте «Выбрать все», чтобы отметить все чаты сразу.\n"
+        "🤖 — бот-админ в чате, 🚫 — бот-админ отсутствует (нужно добавить его в группу)."
     )
     await safe_edit_text(
         call.message,
@@ -616,19 +586,24 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
     message_text_raw = auto.get("message") or "— не задано"
     message_text = quote_html(message_text_raw)
     status = "Активна" if auto.get("is_enabled") else "Отключена"
-    user_sender = call.bot.get("user_sender")
     targets = auto.get("target_chat_ids") or []
+    known_chats = await storage.list_known_chats()
+    available_total = sum(1 for info in known_chats.values() if info.get("delivery_available"))
     if targets:
-        group_line = f"Группы: {len(targets)} выбрано"
-    elif user_sender:
-        auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-        count = 0
-        if auto_sender:
-            personal_chats = await auto_sender.get_personal_chats(refresh=True)
-            count = len(personal_chats)
-        group_line = f"Группы личного аккаунта: {count} (используются все)"
+        missing = [
+            chat_id
+            for chat_id in targets
+            if str(chat_id) not in known_chats or not known_chats[str(chat_id)].get("delivery_available")
+        ]
+        if missing:
+            group_line = "Группы: выбраны недоступные чаты — добавьте бота-админа."
+        else:
+            group_line = f"Группы: {len(targets)} выбрано (доступно {available_total})"
     else:
-        group_line = "Группы: не выбраны"
+        if available_total:
+            group_line = f"Группы: не выбраны (доступно {available_total})"
+        else:
+            group_line = "Группы: нет доступных чатов — добавьте бота-админа."
     payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if payment_valid and latest_payment:
@@ -729,7 +704,7 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
         return
     await storage.set_auto_message(text)
-    await storage.ensure_constraints(require_targets=message.bot.get("user_sender") is None)
+    await storage.ensure_constraints()
     auto_sender: AutoSender = message.bot["auto_sender"]
     await auto_sender.refresh()
     await state.finish()
@@ -765,7 +740,7 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
         await message.reply("Интервал должен быть больше нуля.")
         return
     await storage.set_auto_interval(minutes)
-    await storage.ensure_constraints(require_targets=message.bot.get("user_sender") is None)
+    await storage.ensure_constraints()
     auto_sender: AutoSender = message.bot["auto_sender"]
     await auto_sender.refresh()
     await state.finish()
@@ -860,10 +835,6 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     await call.answer()
-    user_sender = call.bot.get("user_sender")
-    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-    if user_sender and auto_sender:
-        await auto_sender.get_personal_chats(refresh=True)
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
@@ -871,15 +842,16 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
         _, keyboard, _ = await build_main_menu(call.from_user.id)
         await safe_edit_text(
             call.message,
-            "📋 Пока нет групп для рассылки.\nДобавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
+            "📋 Пока нет групп для рассылки.\nДобавьте бота-админа в рабочие чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
     text = (
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопки, чтобы добавить или убрать чат.\n"
-        "Если ничего не выбрано, рассылка идёт во все доступные группы.\n"
-        "Используйте «Выбрать все», чтобы отметить все чаты сразу."
+        "Если ничего не выбрано, рассылка не запускается.\n"
+        "Используйте «Выбрать все», чтобы отметить все чаты сразу.\n"
+        "🤖 — бот-админ в чате, 🚫 — бот-админ отсутствует."
     )
     await safe_edit_text(
         call.message,
@@ -891,10 +863,6 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
 @dp.callback_query_handler(lambda c: c.data.startswith("group:"))
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
     await call.answer()
-    user_sender = call.bot.get("user_sender")
-    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-    if user_sender and auto_sender:
-        await auto_sender.get_personal_chats(refresh=True)
     try:
         _, origin, action = call.data.split(":", maxsplit=2)
     except ValueError:
@@ -910,11 +878,15 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     known = await storage.list_known_chats()
     update_message: str
     if action == "all":
-        if not known:
+        available_ids = [
+            int(chat_id)
+            for chat_id, info in known.items()
+            if info.get("delivery_available")
+        ]
+        if not available_ids:
             await call.answer("Нет доступных чатов.", show_alert=True)
             return
         auto_data = await storage.get_auto()
-        available_ids = [int(chat_id) for chat_id in known.keys()]
         known_set = set(available_ids)
         current_targets = set(auto_data.get("target_chat_ids") or [])
         select_all = bool(known_set) and known_set.issubset(current_targets)
@@ -930,11 +902,21 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         except ValueError:
             await call.answer("Некорректный идентификатор чата", show_alert=True)
             return
-        title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
+        chat_info = known.get(str(chat_id))
+        if not chat_info:
+            await call.answer("Чат не найден. Обновите список.", show_alert=True)
+            return
+        if not chat_info.get("delivery_available"):
+            await call.answer(
+                "Бот-админ не добавлен в этот чат. Добавьте его и попробуйте снова.",
+                show_alert=True,
+            )
+            return
+        title_raw = chat_info.get("title") or str(chat_id)
         title = quote_html(title_raw)
         selected = await storage.toggle_target_chat(chat_id, title_raw)
         update_message = f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}"
-    await storage.ensure_constraints(require_targets=call.bot.get("user_sender") is None)
+    await storage.ensure_constraints()
     auto_sender_instance: AutoSender = call.bot["auto_sender"]
     await auto_sender_instance.refresh()
     known = await storage.list_known_chats()
@@ -1068,28 +1050,25 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
     if not auto.get("message"):
         await call.message.answer("Сначала задайте текст сообщения.")
         return
-    user_sender = call.bot.get("user_sender")
     auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
     selected_targets = auto.get("target_chat_ids") or []
-    if selected_targets and user_sender and auto_sender:
-        personal_chats = await auto_sender.get_personal_chats(refresh=True)
-        available_targets = [chat_id for chat_id in selected_targets if chat_id in personal_chats]
-        if not available_targets:
-            await call.message.answer(
-                "Ни один из выбранных чатов недоступен. Обновите список групп и попробуйте снова."
-            )
-            return
-    elif not selected_targets:
-        if user_sender and auto_sender:
-            personal_chats = await auto_sender.get_personal_chats(refresh=True)
-            if not personal_chats:
-                await call.message.answer(
-                    "Личный аккаунт не состоит ни в одной группе. Добавьте его в рабочие чаты и попробуйте снова."
-                )
-                return
-        else:
-            await call.message.answer("Не выбрано ни одной группы для рассылки.")
-            return
+    if not selected_targets:
+        await call.message.answer("Не выбрано ни одной группы для рассылки.")
+        return
+    delivery_ready = await storage.list_delivery_ready_chat_ids()
+    missing_targets = [chat_id for chat_id in selected_targets if chat_id not in delivery_ready]
+    if missing_targets:
+        known = await storage.list_known_chats()
+        titles = [
+            (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
+            for chat_id in missing_targets
+        ]
+        await call.message.answer(
+            "Бот-админ не добавлен в следующие группы:\n"
+            + "\n".join(f"• {title}" for title in titles)
+            + "\n\nДобавьте его и попробуйте снова."
+        )
+        return
     if (auto.get("interval_minutes") or 0) <= 0:
         await call.message.answer("Неверный интервал. Укажите значение больше нуля.")
         return
@@ -1134,27 +1113,51 @@ async def handle_private_message_without_command(message: types.Message, state: 
     await send_main_menu(message)
 
 
-@dp.my_chat_member_handler()
-async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
-    new_status = update.new_chat_member.status
-    chat = update.chat
-    if chat.type not in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+async def ensure_known_group_chat(chat: types.Chat, *, via_delivery_bot: bool = False) -> None:
+    if chat.type not in GROUP_CHAT_TYPES:
         return
     title = chat.title or chat.full_name or str(chat.id)
-    if new_status in (
+    await storage.upsert_known_chat(
+        chat.id,
+        title,
+        delivery_available=True if via_delivery_bot else None,
+    )
+
+
+async def apply_chat_membership_update(
+    chat: types.Chat,
+    status: str,
+    *,
+    via_delivery_bot: bool = False,
+) -> None:
+    if chat.type not in GROUP_CHAT_TYPES:
+        return
+    if status in (
         types.ChatMemberStatus.ADMINISTRATOR,
         types.ChatMemberStatus.CREATOR,
         types.ChatMemberStatus.MEMBER,
     ):
-        await storage.upsert_known_chat(chat.id, title)
-        logger.info("Добавлен чат %s (%s)", chat.id, title)
-    elif new_status in (
+        await ensure_known_group_chat(chat, via_delivery_bot=via_delivery_bot)
+        logger.info("Добавлен чат %s (%s)", chat.id, chat.title or chat.full_name or str(chat.id))
+    elif status in (
         types.ChatMemberStatus.LEFT,
         types.ChatMemberStatus.KICKED,
         types.ChatMemberStatus.RESTRICTED,
     ):
-        await storage.remove_known_chat(chat.id)
-        logger.info("Удалён чат %s", chat.id)
+        if via_delivery_bot:
+            await storage.set_delivery_available(chat.id, False)
+            logger.info("Бот-админ исключён из чата %s", chat.id)
+        else:
+            if await storage.is_delivery_available(chat.id):
+                logger.info("Основной бот покинул чат %s, но бот-админ остаётся.", chat.id)
+            else:
+                await storage.remove_known_chat(chat.id)
+                logger.info("Удалён чат %s", chat.id)
+
+
+@dp.my_chat_member_handler()
+async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
+    await apply_chat_membership_update(update.chat, update.new_chat_member.status, via_delivery_bot=False)
 
 
 @dp.message_handler(content_types=types.ContentTypes.TEXT, chat_type=[types.ChatType.GROUP, types.ChatType.SUPERGROUP])
@@ -1172,34 +1175,68 @@ async def handle_group_text(message: types.Message) -> None:
         types.ChatMemberStatus.CREATOR,
         types.ChatMemberStatus.MEMBER,
     ):
-        await storage.upsert_known_chat(chat.id, title_raw)
+        await ensure_known_group_chat(chat)
+
+
+async def admin_bot_updates_listener(bot_instance: Bot, stop_event: asyncio.Event) -> None:
+    offset = 0
+    allowed_updates = ["my_chat_member", "message"]
+    logger.info("Админ-бот: отслеживание групп запущено.")
+    while not stop_event.is_set():
+        try:
+            updates = await bot_instance.get_updates(
+                offset=offset,
+                timeout=30,
+                allowed_updates=allowed_updates,
+            )
+        except exceptions.TerminatedByOtherGetUpdates:
+            logger.warning("Админ-бот: найдены параллельные getUpdates. Повтор через 5 с.")
+            await asyncio.sleep(5)
+            continue
+        except exceptions.TelegramAPIError as exc:
+            logger.error("Админ-бот: ошибка получения обновлений: %s", exc)
+            await asyncio.sleep(5)
+            continue
+        except Exception:
+            logger.exception("Админ-бот: неожиданный сбой обновлений.")
+            await asyncio.sleep(5)
+            continue
+        for update in updates:
+            offset = update.update_id + 1
+            if update.my_chat_member:
+                await apply_chat_membership_update(
+                    update.my_chat_member.chat,
+                    update.my_chat_member.new_chat_member.status,
+                    via_delivery_bot=True,
+                )
+            elif update.message and update.message.chat.type in GROUP_CHAT_TYPES:
+                await ensure_known_group_chat(update.message.chat, via_delivery_bot=True)
+        if not updates:
+            continue
+    logger.info("Админ-бот: отслеживание групп остановлено.")
 
 
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
-    user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
-    if user_sender_instance:
-        try:
-            await user_sender_instance.start()
-            identity = await user_sender_instance.describe_self()
-            logger.info("Пользовательская рассылка активирована от %s", identity)
-        except Exception:
-            logger.exception(
-                "Не удалось подключить пользовательскую сессию. Будем отправлять сообщения от имени бота."
-            )
-            user_sender_instance = None
-            dispatcher.bot["user_sender"] = None
+    delivery_bot_instance: Bot = dispatcher.bot.get("delivery_bot") or dispatcher.bot
     auto_sender = AutoSender(
-        dispatcher.bot,
+        delivery_bot_instance,
         storage,
         PAYMENT_VALID_DAYS,
-        user_sender=user_sender_instance,
     )
     dispatcher.bot["auto_sender"] = auto_sender
-    if user_sender_instance:
-        await auto_sender.get_personal_chats(refresh=True)
+    if delivery_bot_instance is not dispatcher.bot and not dispatcher.bot.get("admin_listener_task"):
+        try:
+            await delivery_bot_instance.delete_webhook(drop_pending_updates=False)
+        except exceptions.TelegramAPIError as exc:
+            logger.warning("Админ-бот: не удалось снять webhook перед polling: %s", exc)
+        stop_event = asyncio.Event()
+        dispatcher.bot["admin_listener_stop"] = stop_event
+        dispatcher.bot["admin_listener_task"] = asyncio.create_task(
+            admin_bot_updates_listener(delivery_bot_instance, stop_event)
+        )
     dispatcher.bot["bot_id"] = me.id
-    await storage.ensure_constraints(require_targets=dispatcher.bot.get("user_sender") is None)
+    await storage.ensure_constraints()
     await auto_sender.start_if_enabled()
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
 
@@ -1208,9 +1245,18 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     auto_sender: Optional[AutoSender] = dispatcher.bot.get("auto_sender")
     if auto_sender:
         await auto_sender.stop()
-    user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
-    if user_sender_instance:
-        await user_sender_instance.stop()
+    stop_event: Optional[asyncio.Event] = dispatcher.bot.get("admin_listener_stop")
+    listener_task: Optional[asyncio.Task] = dispatcher.bot.get("admin_listener_task")
+    if stop_event:
+        stop_event.set()
+    if listener_task:
+        try:
+            await listener_task
+        except Exception:
+            logger.exception("Админ-бот: ошибка при остановке слушателя.")
+    delivery_bot_instance: Bot = dispatcher.bot.get("delivery_bot") or dispatcher.bot
+    if delivery_bot_instance is not dispatcher.bot:
+        await delivery_bot_instance.session.close()
     await dispatcher.storage.close()
     await dispatcher.storage.wait_closed()
 

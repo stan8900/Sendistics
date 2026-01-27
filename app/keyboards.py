@@ -1,4 +1,4 @@
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -51,7 +51,7 @@ def auto_menu_keyboard(*, is_enabled: bool, allow_group_pick: bool) -> InlineKey
 
 
 def groups_keyboard(
-    known_chats: Dict[str, Dict[str, str]],
+    known_chats: Dict[str, Dict[str, Any]],
     selected_ids: Iterable[int],
     *,
     origin: str = "auto",
@@ -66,9 +66,10 @@ def groups_keyboard(
     for chat_id, chat_info in sorted_items:
         title = chat_info.get("title") or f"Чат {chat_id}"
         prefix = "✅" if chat_id in selected_set else "➕"
+        availability_marker = "🤖" if chat_info.get("delivery_available") else "🚫"
         rows.append([
             InlineKeyboardButton(
-                f"{prefix} {title[:48]}", callback_data=f"group:{origin}:{chat_id}"
+                f"{prefix} {availability_marker} {title[:40]}", callback_data=f"group:{origin}:{chat_id}"
             )
         ])
     if chat_ids:

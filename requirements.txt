@@ -2,5 +2,4 @@ aiohttp>=3.8.6,<3.9
 aiogram==2.25.2
 python-dotenv>=1.0
 fpdf==1.7.2
-telethon>=1.30,<1.31
 psycopg[binary]>=3.1
