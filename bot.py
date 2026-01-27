@@ -73,14 +73,26 @@ storage = create_storage()
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
 tg_user_session = os.getenv("TG_USER_SESSION")
-tg_user_folder_names_raw = os.getenv("TG_USER_FOLDER_NAME") or os.getenv("TG_USER_FOLDER_NAMES")
+tgi_folder_raw = os.getenv("TG_USER_FOLDER_NAME") or os.getenv("TG_USER_FOLDER_NAMES")
 tg_user_folder_names: Optional[list[str]]
-if tg_user_folder_names_raw:
-    tg_user_folder_names = [name.strip() for name in tg_user_folder_names_raw.split(",") if name.strip()]
+if tgi_folder_raw:
+    tg_user_folder_names = [name.strip() for name in tgi_folder_raw.replace(";", ",").split(",") if name.strip()]
     if not tg_user_folder_names:
         tg_user_folder_names = None
 else:
     tg_user_folder_names = None
+tg_user_allowed_chats_raw = os.getenv("TG_USER_ALLOWED_CHATS")
+tg_user_allowed_chats: Optional[list[str]]
+if tg_user_allowed_chats_raw:
+    delimiters = [",", "\n", ";"]
+    processed = tg_user_allowed_chats_raw
+    for delim in delimiters[1:]:
+        processed = processed.replace(delim, delimiters[0])
+    tg_user_allowed_chats = [item.strip() for item in processed.split(delimiters[0]) if item.strip()]
+    if not tg_user_allowed_chats:
+        tg_user_allowed_chats = None
+else:
+    tg_user_allowed_chats = None
 user_sender: Optional[UserSender]
 if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
     try:
@@ -94,6 +106,7 @@ if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
             tg_user_api_hash,
             tg_user_session,
             allowed_folder_titles=tg_user_folder_names,
+            allowed_chat_identifiers=tg_user_allowed_chats,
         )
 else:
     user_sender = None
