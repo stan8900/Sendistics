@@ -1181,6 +1181,31 @@ async def handle_group_text(message: types.Message) -> None:
         await ensure_known_group_chat(chat)
 
 
+async def refresh_delivery_availability(bot_instance: Bot) -> None:
+    known = await storage.list_known_chats()
+    if not known:
+        return
+    try:
+        me = await bot_instance.get_me()
+    except exceptions.TelegramAPIError as exc:
+        logger.warning("Админ-бот: не удалось получить информацию о себе: %s", exc)
+        return
+    allowed_statuses = {
+        types.ChatMemberStatus.ADMINISTRATOR,
+        types.ChatMemberStatus.CREATOR,
+        types.ChatMemberStatus.MEMBER,
+    }
+    for chat_key, info in known.items():
+        chat_id = int(chat_key)
+        try:
+            member = await bot_instance.get_chat_member(chat_id, me.id)
+        except exceptions.TelegramAPIError as exc:
+            await storage.set_delivery_available(chat_id, False)
+            logger.info("Админ-бот: чат %s недоступен (%s)", chat_id, exc)
+            continue
+        await storage.set_delivery_available(chat_id, member.status in allowed_statuses)
+
+
 async def admin_bot_updates_listener(bot_instance: Bot, stop_event: asyncio.Event) -> None:
     offset = 0
     allowed_updates = ["my_chat_member", "message"]
@@ -1240,7 +1265,9 @@ async def on_startup(dispatcher: Dispatcher) -> None:
     )
     dispatcher.bot["bot_id"] = me.id
     await storage.ensure_constraints()
-    if not USE_SEPARATE_DELIVERY_BOT:
+    if USE_SEPARATE_DELIVERY_BOT:
+        await refresh_delivery_availability(delivery_bot_instance)
+    else:
         await storage.mark_all_chats_delivery_available()
     await auto_sender.start_if_enabled()
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
