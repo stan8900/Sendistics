@@ -82,6 +82,7 @@ admin_bot_token = os.getenv("ADMIN_BOT_TOKEN")
 if admin_bot_token == BOT_TOKEN:
     logger.warning("ADMIN_BOT_TOKEN совпадает с токеном основного бота, используем один экземпляр.")
     admin_bot_token = None
+USE_SEPARATE_DELIVERY_BOT = bool(admin_bot_token)
 if admin_bot_token:
     delivery_bot = Bot(token=admin_bot_token, parse_mode=types.ParseMode.HTML)
 else:
@@ -1117,10 +1118,11 @@ async def ensure_known_group_chat(chat: types.Chat, *, via_delivery_bot: bool = 
     if chat.type not in GROUP_CHAT_TYPES:
         return
     title = chat.title or chat.full_name or str(chat.id)
+    delivery_ready = via_delivery_bot or not USE_SEPARATE_DELIVERY_BOT
     await storage.upsert_known_chat(
         chat.id,
         title,
-        delivery_available=True if via_delivery_bot else None,
+        delivery_available=True if delivery_ready else None,
     )
 
 
@@ -1148,7 +1150,8 @@ async def apply_chat_membership_update(
             await storage.set_delivery_available(chat.id, False)
             logger.info("Бот-админ исключён из чата %s", chat.id)
         else:
-            if await storage.is_delivery_available(chat.id):
+            delivery_available = await storage.is_delivery_available(chat.id)
+            if USE_SEPARATE_DELIVERY_BOT and delivery_available:
                 logger.info("Основной бот покинул чат %s, но бот-админ остаётся.", chat.id)
             else:
                 await storage.remove_known_chat(chat.id)
@@ -1232,11 +1235,13 @@ async def on_startup(dispatcher: Dispatcher) -> None:
             logger.warning("Админ-бот: не удалось снять webhook перед polling: %s", exc)
         stop_event = asyncio.Event()
         dispatcher.bot["admin_listener_stop"] = stop_event
-        dispatcher.bot["admin_listener_task"] = asyncio.create_task(
-            admin_bot_updates_listener(delivery_bot_instance, stop_event)
-        )
+    dispatcher.bot["admin_listener_task"] = asyncio.create_task(
+        admin_bot_updates_listener(delivery_bot_instance, stop_event)
+    )
     dispatcher.bot["bot_id"] = me.id
     await storage.ensure_constraints()
+    if not USE_SEPARATE_DELIVERY_BOT:
+        await storage.mark_all_chats_delivery_available()
     await auto_sender.start_if_enabled()
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
 

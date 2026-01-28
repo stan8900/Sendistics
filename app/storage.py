@@ -193,6 +193,11 @@ class Storage:
             ).fetchall()
             return {int(row["chat_id"]) for row in rows}
 
+    async def mark_all_chats_delivery_available(self) -> None:
+        async with self._lock:
+            self._execute("UPDATE known_chats SET delivery_available = 1")
+            self._commit()
+
     async def set_target_chats(self, chat_ids: Iterable[int]) -> None:
         async with self._lock:
             unique_ids: List[int] = []
