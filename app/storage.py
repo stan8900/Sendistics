@@ -75,6 +75,11 @@ class Storage:
         if not self._is_postgres:
             self._conn.commit()
 
+    def _bool_param(self, value: bool) -> Any:
+        if self._is_postgres:
+            return bool(value)
+        return 1 if value else 0
+
     async def get_data(self) -> Dict[str, Any]:
         async with self._lock:
             return {
@@ -174,7 +179,7 @@ class Storage:
         async with self._lock:
             self._execute(
                 "UPDATE known_chats SET delivery_available = ? WHERE chat_id = ?",
-                (1 if available else 0, chat_id),
+                (self._bool_param(available), chat_id),
             )
             self._commit()
 
@@ -195,7 +200,11 @@ class Storage:
 
     async def mark_all_chats_delivery_available(self) -> None:
         async with self._lock:
-            self._execute("UPDATE known_chats SET delivery_available = 1")
+            value = self._bool_param(True)
+            self._execute(
+                "UPDATE known_chats SET delivery_available = ?" if self._is_postgres else "UPDATE known_chats SET delivery_available = 1",
+                (value,) if self._is_postgres else (),
+            )
             self._commit()
 
     async def set_target_chats(self, chat_ids: Iterable[int]) -> None:
@@ -509,7 +518,7 @@ class Storage:
                 title = excluded.title,
                 delivery_available = excluded.delivery_available
             """,
-            (chat_id, sanitized_title, 1 if delivery_available else 0),
+            (chat_id, sanitized_title, self._bool_param(delivery_available)),
         )
 
     def _init_db(self) -> None:
