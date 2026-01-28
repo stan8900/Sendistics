@@ -193,9 +193,15 @@ class Storage:
 
     async def list_delivery_ready_chat_ids(self) -> Set[int]:
         async with self._lock:
-            rows = self._execute(
-                "SELECT chat_id FROM known_chats WHERE delivery_available = 1"
-            ).fetchall()
+            if self._is_postgres:
+                rows = self._execute(
+                    "SELECT chat_id FROM known_chats WHERE delivery_available = %s",
+                    (self._bool_param(True),),
+                ).fetchall()
+            else:
+                rows = self._execute(
+                    "SELECT chat_id FROM known_chats WHERE delivery_available = 1"
+                ).fetchall()
             return {int(row["chat_id"]) for row in rows}
 
     async def mark_all_chats_delivery_available(self) -> None:
