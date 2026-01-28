@@ -81,3 +81,11 @@ def groups_keyboard(
         InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def inbox_reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton("✉️ Ответить", callback_data=f"inbox:reply:{user_id}")],
+        ]
+    )

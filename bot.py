@@ -15,9 +15,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from dotenv import load_dotenv
 
 from app.auto_sender import AutoSender
-from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboard
+from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboard, inbox_reply_keyboard
 from app.pdf_reports import build_payments_pdf
-from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
+from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates, AdminInboxStates
 from app.storage import Storage
 
 
@@ -254,6 +254,54 @@ async def notify_admins_about_payment(requester_id: int, request_id: str) -> Non
             )
         except exceptions.TelegramAPIError as exc:
             logger.error("Не удалось уведомить админа %s: %s", admin_id, exc)
+
+
+async def notify_admins_about_incoming_message(message: types.Message) -> bool:
+    if not message.from_user:
+        return False
+    user = message.from_user
+    if await is_admin_user(user.id):
+        return False
+    admin_ids = await collect_admin_ids()
+    if not admin_ids:
+        return False
+    full_name = quote_html(user.full_name or "Неизвестный пользователь")
+    username = f"@{user.username}" if user.username else "—"
+    preview = message.text or message.caption or ""
+    preview = preview.strip()
+    if preview:
+        if len(preview) > 600:
+            preview = preview[:597] + "..."
+        preview = quote_html(preview)
+    header_lines = [
+        "📥 <b>Новое обращение</b>",
+        f"Имя: {full_name}",
+        f"Username: {username}",
+        f"ID: <code>{user.id}</code>",
+    ]
+    if preview:
+        header_lines.append(f"Текст: {preview}")
+    header_lines.append("Нажмите «Ответить», чтобы ответить пользователю.")
+    header = "\n".join(header_lines)
+    keyboard = inbox_reply_keyboard(user.id)
+    delivered = False
+    for admin_id in admin_ids:
+        if admin_id == user.id:
+            continue
+        if not await is_admin_user(admin_id):
+            continue
+        try:
+            await bot.send_message(admin_id, header, reply_markup=keyboard)
+            await bot.forward_message(admin_id, message.chat.id, message.message_id)
+            delivered = True
+        except exceptions.TelegramAPIError as exc:
+            logger.warning(
+                "Не удалось переслать сообщение пользователя %s админу %s: %s",
+                user.id,
+                admin_id,
+                exc,
+            )
+    return delivered
 
 
 def build_user_payment_status_message(status: str, resolved_at: Optional[str]) -> str:
@@ -1111,7 +1159,67 @@ async def cb_auto_stop(call: types.CallbackQuery) -> None:
 async def handle_private_message_without_command(message: types.Message, state: FSMContext) -> None:
     if await state.get_state():
         return
+    if not await is_admin_user(message.from_user.id):
+        notified = await notify_admins_about_incoming_message(message)
+        if notified:
+            await message.answer("💬 Сообщение отправлено администраторам. Ответ придёт здесь.")
+        else:
+            await message.answer(
+                "Сообщение получено. Как только администратор будет доступен, он ответит в этом чате."
+            )
+    else:
+        await message.answer("Сообщение получено.")
     await send_main_menu(message)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("inbox:reply:"), state="*")
+async def cb_inbox_reply(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    try:
+        _, _, user_id_raw = call.data.split(":", maxsplit=2)
+        target_user_id = int(user_id_raw)
+    except (ValueError, TypeError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+    await call.answer()
+    await state.finish()
+    await AdminInboxStates.waiting_for_reply.set()
+    await state.update_data(reply_target=target_user_id)
+    await call.message.answer(
+        f"Введите ответ для пользователя <code>{target_user_id}</code>.\n"
+        "Используйте /cancel для отмены."
+    )
+
+
+@dp.message_handler(state=AdminInboxStates.waiting_for_reply, content_types=types.ContentTypes.ANY)
+async def handle_admin_reply(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    target_user_id = data.get("reply_target")
+    if not target_user_id:
+        await message.answer("Не удалось определить пользователя для ответа. Попробуйте снова.")
+        await state.finish()
+        return
+    try:
+        if message.content_type == types.ContentType.TEXT:
+            text = (message.text or "").strip()
+            if not text:
+                await message.answer("Введите текст ответа или используйте /cancel.")
+                return
+            await bot.send_message(
+                target_user_id,
+                "💬 Сообщение от администратора:\n" + text,
+            )
+        else:
+            await bot.send_message(target_user_id, "💬 Администратор отправил вам сообщение:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
+        await message.answer("Ответ отправлен пользователю.")
+    except exceptions.TelegramAPIError as exc:
+        logger.error("Не удалось отправить сообщение пользователю %s: %s", target_user_id, exc)
+        await message.answer("Не удалось отправить сообщение пользователю. Попробуйте позже.")
+    finally:
+        await state.finish()
 
 
 async def ensure_known_group_chat(chat: types.Chat, *, via_delivery_bot: bool = False) -> None:

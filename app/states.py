@@ -17,3 +17,7 @@ class AdminLoginStates(StatesGroup):
 
 class AdminManualPaymentStates(StatesGroup):
     waiting_for_user = State()
+
+
+class AdminInboxStates(StatesGroup):
+    waiting_for_reply = State()
