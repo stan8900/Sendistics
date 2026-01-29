@@ -160,5 +160,9 @@ class AutoSender:
     async def _resolve_targets(self, auto: dict) -> List[int]:
         if self._user_sender:
             personal_chats = await self.get_personal_chats(refresh=not self._personal_chats)
+            available_ids = set(personal_chats.keys())
+            selected = [int(chat_id) for chat_id in auto.get("target_chat_ids") or []]
+            if selected:
+                return [chat_id for chat_id in selected if chat_id in available_ids]
             return list(personal_chats.keys())
         return list(auto.get("target_chat_ids") or [])
