@@ -206,13 +206,23 @@ class Storage:
 
     async def replace_delivery_ready_chat_ids(self, chat_ids: Set[int]) -> None:
         async with self._lock:
-            self._execute("UPDATE known_chats SET delivery_available = 0")
+            reset_value = False if self._is_postgres else 0
+            if self._is_postgres:
+                self._execute("UPDATE known_chats SET delivery_available = %s", (reset_value,))
+            else:
+                self._execute("UPDATE known_chats SET delivery_available = 0")
             if chat_ids:
                 value = self._bool_param(True)
-                self._executemany(
-                    "UPDATE known_chats SET delivery_available = ? WHERE chat_id = ?",
-                    ((value, chat_id) for chat_id in chat_ids),
-                )
+                if self._is_postgres:
+                    self._executemany(
+                        "UPDATE known_chats SET delivery_available = %s WHERE chat_id = %s",
+                        ((value, chat_id) for chat_id in chat_ids),
+                    )
+                else:
+                    self._executemany(
+                        "UPDATE known_chats SET delivery_available = ? WHERE chat_id = ?",
+                        ((value, chat_id) for chat_id in chat_ids),
+                    )
             self._commit()
 
     async def mark_all_chats_delivery_available(self) -> None:
