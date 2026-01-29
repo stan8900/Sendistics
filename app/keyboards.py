@@ -69,8 +69,10 @@ def groups_keyboard(
             )
         ])
     if total_known:
-        select_all_label = "❎ Снять все" if total_known == len(selected_set) and selected_set else "✅ Выбрать все"
-        rows.append([InlineKeyboardButton(select_all_label, callback_data=f"group:{origin}:all")])
+        rows.append([
+            InlineKeyboardButton("✅ Выбрать все", callback_data=f"group:{origin}:select_all"),
+            InlineKeyboardButton("❎ Снять все", callback_data=f"group:{origin}:clear_all"),
+        ])
     rows.append([
         InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")
     ])

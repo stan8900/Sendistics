@@ -357,6 +357,13 @@ async def send_main_menu(message: types.Message, *, edit: bool = False, user_id:
         await message.answer(text, reply_markup=keyboard)
 
 
+async def safe_edit_text(message: types.Message, text: str, **kwargs: Any) -> None:
+    try:
+        await message.edit_text(text, **kwargs)
+    except exceptions.MessageNotModified:
+        pass
+
+
 async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: int) -> None:
     status = "Активна ✅" if auto_data.get("is_enabled") else "Не запущена"
     message_preview_raw = auto_data.get("message") or "— не задано"
@@ -567,7 +574,8 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
                 "📋 Пока нет групп для рассылки.\n"
                 "Добавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку."
             )
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             empty_text,
             reply_markup=keyboard,
         )
@@ -576,7 +584,8 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопку, чтобы добавить или убрать чат."
     )
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         header,
         reply_markup=groups_keyboard(known, selected, origin="main"),
     )
@@ -859,7 +868,8 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
             empty_text = (
                 "📋 Пока нет групп для рассылки.\nДобавьте бота в нужные чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку."
             )
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             empty_text,
             reply_markup=keyboard,
         )
@@ -868,7 +878,8 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопки, чтобы добавить или убрать чат."
     )
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         text,
         reply_markup=groups_keyboard(known, selected, origin="auto"),
     )
@@ -890,18 +901,20 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             auto_data = await storage.get_auto(user_id)
             await show_auto_menu(call.message, auto_data, user_id=user_id)
         return
-    if action == "all":
+    if action in {"select_all", "clear_all"}:
         known = await storage.list_known_chats()
         if not known:
             await call.answer("Нет доступных групп.", show_alert=True)
             return
         auto = await storage.get_auto(user_id)
-        selected_now = set(auto.get("target_chat_ids") or [])
-        all_ids = sorted(int(info["chat_id"]) for info in known.values())
-        if all_ids and len(selected_now) == len(all_ids):
+        if action == "clear_all":
             await storage.clear_target_chats(user_id)
             status_line = "Все группы сняты из рассылки."
         else:
+            all_ids = sorted(int(info["chat_id"]) for info in known.values())
+            if not all_ids:
+                await call.answer("Нет групп для выбора.", show_alert=True)
+                return
             await storage.set_target_chats(user_id, all_ids)
             status_line = "Все группы выбраны для рассылки."
         await storage.ensure_constraints(
@@ -916,7 +929,8 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             "📋 <b>Выбор групп для рассылки</b>\n\n"
             f"{status_line}\nПри необходимости уточните список или нажмите 'Готово'."
         )
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             reply_text,
             reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
         )
@@ -943,7 +957,8 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}\n"
         "При необходимости выберите другие чаты или нажмите 'Готово'."
     )
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         reply_text,
         reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
     )
