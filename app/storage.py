@@ -3,7 +3,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from uuid import uuid4
 
 try:
@@ -27,6 +27,7 @@ class Storage:
         self._database_url = database_url
         self._is_postgres = bool(database_url)
         self._lock = asyncio.Lock()
+        self._legacy_auto_defaults: Optional[Tuple[Optional[str], int]] = None
         if self._is_postgres:
             if not database_url:
                 raise ValueError("DATABASE_URL must be provided for PostgreSQL storage.")
@@ -83,67 +84,105 @@ class Storage:
     async def get_data(self) -> Dict[str, Any]:
         async with self._lock:
             return {
-                "auto": self._get_auto_locked(),
+                "auto": self._get_auto_overview_locked(),
+                "campaigns": self._list_auto_campaigns_locked(),
                 "known_chats": self._list_known_chats_locked(),
                 "payments": self._list_payments_locked(),
                 "sessions": self._list_sessions_locked(),
             }
 
-    async def get_auto(self) -> Dict[str, Any]:
+    async def get_auto(self, owner_id: Optional[int] = None) -> Dict[str, Any]:
         async with self._lock:
-            return self._get_auto_locked()
+            if owner_id is None:
+                return self._get_auto_overview_locked()
+            return self._get_auto_campaign_locked(owner_id)
 
-    async def set_auto_message(self, message: str) -> None:
+    async def list_auto_campaigns(self) -> List[Dict[str, Any]]:
         async with self._lock:
+            return self._list_auto_campaigns_locked()
+
+    async def list_active_campaigns(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            rows = self._execute(
+                "SELECT owner_id FROM auto_campaigns WHERE is_enabled = ?",
+                (1,),
+            ).fetchall()
+            return [self._get_auto_campaign_locked(int(row["owner_id"])) for row in rows]
+
+    async def set_auto_message(self, owner_id: int, message: str) -> None:
+        async with self._lock:
+            self._ensure_campaign_locked(owner_id)
             self._execute(
-                "UPDATE auto_config SET message = ? WHERE id = 1",
-                (message,),
+                "UPDATE auto_campaigns SET message = ? WHERE owner_id = ?",
+                (message, owner_id),
             )
             self._commit()
 
-    async def set_auto_interval(self, minutes: int) -> None:
+    async def set_auto_interval(self, owner_id: int, minutes: int) -> None:
         async with self._lock:
+            self._ensure_campaign_locked(owner_id)
             self._execute(
-                "UPDATE auto_config SET interval_minutes = ? WHERE id = 1",
-                (minutes,),
+                "UPDATE auto_campaigns SET interval_minutes = ? WHERE owner_id = ?",
+                (minutes, owner_id),
             )
             self._commit()
 
-    async def set_auto_enabled(self, enabled: bool) -> None:
+    async def set_auto_enabled(self, owner_id: int, enabled: bool) -> None:
         async with self._lock:
+            self._ensure_campaign_locked(owner_id)
             self._execute(
-                "UPDATE auto_config SET is_enabled = ? WHERE id = 1",
-                (1 if enabled else 0,),
+                "UPDATE auto_campaigns SET is_enabled = ? WHERE owner_id = ?",
+                (1 if enabled else 0, owner_id),
             )
             self._commit()
 
-    async def toggle_target_chat(self, chat_id: int, title: Optional[str] = None) -> bool:
+    async def toggle_target_chat(self, owner_id: int, chat_id: int, title: Optional[str] = None) -> bool:
         async with self._lock:
-            cur = self._execute("SELECT 1 FROM auto_targets WHERE chat_id = ?", (chat_id,))
+            self._ensure_campaign_locked(owner_id)
+            cur = self._execute(
+                "SELECT 1 FROM auto_campaign_targets WHERE owner_id = ? AND chat_id = ?",
+                (owner_id, chat_id),
+            )
             exists = cur.fetchone() is not None
             if exists:
-                self._execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
+                self._execute(
+                    "DELETE FROM auto_campaign_targets WHERE owner_id = ? AND chat_id = ?",
+                    (owner_id, chat_id),
+                )
                 self._commit()
                 return False
             self._execute(
-                "INSERT INTO auto_targets (chat_id) VALUES (?) ON CONFLICT (chat_id) DO NOTHING",
-                (chat_id,),
+                """
+                INSERT INTO auto_campaign_targets (owner_id, chat_id)
+                VALUES (?, ?)
+                ON CONFLICT (owner_id, chat_id) DO NOTHING
+                """,
+                (owner_id, chat_id),
             )
             if title:
                 self._ensure_known_chat_locked(chat_id, title)
             self._commit()
             return True
 
-    async def update_stats(self, *, sent: int, errors: List[str]) -> None:
+    async def update_stats(self, owner_id: int, *, sent: int, errors: List[str]) -> None:
         async with self._lock:
-            stats = self._execute("SELECT sent_total FROM auto_stats WHERE id = 1").fetchone()
+            self._ensure_campaign_locked(owner_id)
+            stats = self._execute(
+                "SELECT sent_total FROM auto_campaign_stats WHERE owner_id = ?",
+                (owner_id,),
+            ).fetchone()
             sent_total = (stats["sent_total"] if stats else 0) + sent
             self._execute(
-                "UPDATE auto_stats SET sent_total = ?, last_sent_at = ?, last_error = ? WHERE id = 1",
+                """
+                UPDATE auto_campaign_stats
+                SET sent_total = ?, last_sent_at = ?, last_error = ?
+                WHERE owner_id = ?
+                """,
                 (
                     sent_total,
                     datetime.utcnow().isoformat(),
                     "\n".join(errors) if errors else None,
+                    owner_id,
                 ),
             )
             self._commit()
@@ -173,6 +212,10 @@ class Storage:
         async with self._lock:
             self._execute("DELETE FROM known_chats WHERE chat_id = ?", (chat_id,))
             self._execute("DELETE FROM auto_targets WHERE chat_id = ?", (chat_id,))
+            self._execute(
+                "DELETE FROM auto_campaign_targets WHERE chat_id = ?",
+                (chat_id,),
+            )
             self._commit()
 
     async def set_delivery_available(self, chat_id: int, available: bool) -> None:
@@ -234,8 +277,9 @@ class Storage:
             )
             self._commit()
 
-    async def set_target_chats(self, chat_ids: Iterable[int]) -> None:
+    async def set_target_chats(self, owner_id: int, chat_ids: Iterable[int]) -> None:
         async with self._lock:
+            self._ensure_campaign_locked(owner_id)
             unique_ids: List[int] = []
             seen = set()
             for chat_id in chat_ids:
@@ -247,11 +291,17 @@ class Storage:
                     continue
                 seen.add(cid)
                 unique_ids.append(cid)
-            self._execute("DELETE FROM auto_targets")
+            self._execute(
+                "DELETE FROM auto_campaign_targets WHERE owner_id = ?",
+                (owner_id,),
+            )
             if unique_ids:
                 self._executemany(
-                    "INSERT INTO auto_targets (chat_id) VALUES (?)",
-                    ((chat_id,) for chat_id in unique_ids),
+                    """
+                    INSERT INTO auto_campaign_targets (owner_id, chat_id)
+                    VALUES (?, ?)
+                    """,
+                    ((owner_id, chat_id) for chat_id in unique_ids),
                 )
             self._commit()
 
@@ -461,39 +511,30 @@ class Storage:
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
 
-    async def ensure_constraints(self) -> None:
+    async def ensure_constraints(self, owner_id: Optional[int] = None) -> None:
         async with self._lock:
-            auto = self._get_auto_locked()
-            targets_valid = bool(auto["target_chat_ids"])
-            if not auto["message"] or not targets_valid or auto["interval_minutes"] <= 0:
-                self._execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
+            if owner_id is not None:
+                owner_ids = [owner_id]
+            else:
+                rows = self._execute("SELECT owner_id FROM auto_campaigns").fetchall()
+                owner_ids = [int(row["owner_id"]) for row in rows]
+            if not owner_ids:
+                return
+            changed = False
+            for oid in owner_ids:
+                self._ensure_campaign_locked(oid)
+                campaign = self._get_auto_campaign_locked(oid)
+                has_message = bool(campaign["message"])
+                has_targets = bool(campaign["target_chat_ids"])
+                interval_ok = (campaign.get("interval_minutes") or 0) > 0
+                if not (has_message and has_targets and interval_ok):
+                    self._execute(
+                        "UPDATE auto_campaigns SET is_enabled = 0 WHERE owner_id = ?",
+                        (oid,),
+                    )
+                    changed = True
+            if changed:
                 self._commit()
-
-    def _get_auto_locked(self) -> Dict[str, Any]:
-        config = self._execute(
-            "SELECT message, interval_minutes, is_enabled FROM auto_config WHERE id = 1"
-        ).fetchone()
-        stats = self._execute(
-            "SELECT sent_total, last_sent_at, last_error FROM auto_stats WHERE id = 1"
-        ).fetchone()
-        targets = [
-            row["chat_id"]
-            for row in self._execute(
-                "SELECT chat_id FROM auto_targets ORDER BY chat_id"
-            )
-        ]
-        auto = {
-            "message": config["message"] if config else None,
-            "interval_minutes": config["interval_minutes"] if config else 0,
-            "target_chat_ids": targets,
-            "is_enabled": bool(config["is_enabled"]) if config else False,
-            "stats": {
-                "sent_total": stats["sent_total"] if stats else 0,
-                "last_sent_at": stats["last_sent_at"] if stats else None,
-                "last_error": stats["last_error"] if stats else None,
-            },
-        }
-        return auto
 
     def _list_known_chats_locked(self) -> Dict[str, Dict[str, Any]]:
         rows = self._execute(
@@ -614,6 +655,7 @@ class Storage:
             """
         )
         self._ensure_known_chats_schema()
+        self._ensure_campaigns_schema()
 
     def _ensure_known_chats_schema(self) -> None:
         if self._is_postgres:
@@ -648,11 +690,170 @@ class Storage:
         )
         self._commit()
 
+    def _legacy_auto_defaults_locked(self) -> Tuple[Optional[str], int]:
+        if self._legacy_auto_defaults is not None:
+            return self._legacy_auto_defaults
+        row = self._execute(
+            "SELECT message, interval_minutes FROM auto_config WHERE id = 1"
+        ).fetchone()
+        default_message = row["message"] if row else None
+        interval = row["interval_minutes"] if row and row["interval_minutes"] else 60
+        if not interval or interval <= 0:
+            interval = 60
+        self._legacy_auto_defaults = (default_message, interval)
+        return self._legacy_auto_defaults
+
+    def _ensure_campaign_locked(self, owner_id: int) -> None:
+        defaults = self._legacy_auto_defaults_locked()
+        self._execute(
+            """
+            INSERT INTO auto_campaigns (owner_id, message, interval_minutes, is_enabled)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT (owner_id) DO NOTHING
+            """,
+            (owner_id, defaults[0], defaults[1]),
+        )
+        self._execute(
+            """
+            INSERT INTO auto_campaign_stats (owner_id, sent_total)
+            VALUES (?, 0)
+            ON CONFLICT (owner_id) DO NOTHING
+            """,
+            (owner_id,),
+        )
+        self._seed_campaign_targets_locked(owner_id)
+
+    def _seed_campaign_targets_locked(self, owner_id: int) -> None:
+        row = self._execute(
+            "SELECT 1 FROM auto_campaign_targets WHERE owner_id = ? LIMIT 1",
+            (owner_id,),
+        ).fetchone()
+        if row:
+            return
+        legacy_targets = self._execute(
+            "SELECT chat_id FROM auto_targets ORDER BY chat_id"
+        ).fetchall()
+        if not legacy_targets:
+            return
+        self._executemany(
+            """
+            INSERT INTO auto_campaign_targets (owner_id, chat_id)
+            VALUES (?, ?)
+            ON CONFLICT (owner_id, chat_id) DO NOTHING
+            """,
+            ((owner_id, int(target["chat_id"])) for target in legacy_targets),
+        )
+
+    def _get_auto_overview_locked(self) -> Dict[str, Any]:
+        stats_rows = self._execute(
+            "SELECT owner_id, sent_total, last_sent_at, last_error FROM auto_campaign_stats"
+        ).fetchall()
+        sent_total = 0
+        last_sent_at: Optional[str] = None
+        last_error: Optional[str] = None
+        for row in stats_rows:
+            sent_total += row["sent_total"] or 0
+            ts = row["last_sent_at"]
+            if ts and (last_sent_at is None or ts > last_sent_at):
+                last_sent_at = ts
+                last_error = row["last_error"]
+            elif not last_sent_at and row["last_error"]:
+                last_error = row["last_error"]
+        campaigns = self._execute(
+            "SELECT owner_id, is_enabled FROM auto_campaigns"
+        ).fetchall()
+        campaigns_total = len(campaigns)
+        campaigns_active = sum(1 for row in campaigns if row["is_enabled"])
+        return {
+            "campaigns_total": campaigns_total,
+            "campaigns_active": campaigns_active,
+            "stats": {
+                "sent_total": sent_total,
+                "last_sent_at": last_sent_at,
+                "last_error": last_error,
+            },
+        }
+
+    def _get_auto_campaign_locked(self, owner_id: int) -> Dict[str, Any]:
+        self._ensure_campaign_locked(owner_id)
+        config = self._execute(
+            "SELECT message, interval_minutes, is_enabled FROM auto_campaigns WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+        stats = self._execute(
+            "SELECT sent_total, last_sent_at, last_error FROM auto_campaign_stats WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+        targets = [
+            row["chat_id"]
+            for row in self._execute(
+                "SELECT chat_id FROM auto_campaign_targets WHERE owner_id = ? ORDER BY chat_id",
+                (owner_id,),
+            )
+        ]
+        return {
+            "owner_id": owner_id,
+            "message": config["message"] if config else None,
+            "interval_minutes": config["interval_minutes"] if config else 0,
+            "target_chat_ids": targets,
+            "is_enabled": bool(config["is_enabled"]) if config else False,
+            "stats": {
+                "sent_total": stats["sent_total"] if stats else 0,
+                "last_sent_at": stats["last_sent_at"] if stats else None,
+                "last_error": stats["last_error"] if stats else None,
+            },
+        }
+
+    def _list_auto_campaigns_locked(self) -> List[Dict[str, Any]]:
+        rows = self._execute("SELECT owner_id FROM auto_campaigns ORDER BY owner_id").fetchall()
+        return [self._get_auto_campaign_locked(int(row["owner_id"])) for row in rows]
+
+    def _ensure_campaigns_schema(self) -> None:
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_campaigns (
+                owner_id BIGINT PRIMARY KEY,
+                message TEXT,
+                interval_minutes INTEGER NOT NULL DEFAULT 60,
+                is_enabled INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_campaign_stats (
+                owner_id BIGINT PRIMARY KEY,
+                sent_total INTEGER NOT NULL DEFAULT 0,
+                last_sent_at TEXT,
+                last_error TEXT,
+                FOREIGN KEY(owner_id) REFERENCES auto_campaigns(owner_id) ON DELETE CASCADE
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_campaign_targets (
+                owner_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                PRIMARY KEY(owner_id, chat_id),
+                FOREIGN KEY(owner_id) REFERENCES auto_campaigns(owner_id) ON DELETE CASCADE,
+                FOREIGN KEY(chat_id) REFERENCES known_chats(chat_id) ON DELETE CASCADE
+            )
+            """
+        )
+
     def _has_any_data(self) -> bool:
         cur = self._execute("SELECT message, is_enabled FROM auto_config WHERE id = 1").fetchone()
         if cur and (cur["message"] or cur["is_enabled"]):
             return True
-        for table in ("known_chats", "auto_targets", "payments", "sessions"):
+        for table in (
+            "auto_campaigns",
+            "auto_campaign_targets",
+            "known_chats",
+            "auto_targets",
+            "payments",
+            "sessions",
+        ):
             row = self._execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
             if row and row["cnt"]:
                 return True
