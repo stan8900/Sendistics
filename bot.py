@@ -991,12 +991,18 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         if not available_ids:
             await call.answer("Нет доступных чатов.", show_alert=True)
             return
-        clear_all = mode == "clear"
-        if mode is None:
-            auto_data = await storage.get_auto(call.from_user.id)
-            known_set = set(available_ids)
-            current_targets = set(auto_data.get("target_chat_ids") or [])
-            clear_all = bool(known_set) and known_set.issubset(current_targets)
+        auto_data = await storage.get_auto(call.from_user.id)
+        known_set = set(available_ids)
+        current_targets = set(auto_data.get("target_chat_ids") or [])
+        all_selected = bool(known_set) and known_set.issubset(current_targets)
+        if mode == "clear":
+            clear_all = True
+        elif mode == "fill":
+            clear_all = False
+            if all_selected:
+                clear_all = True
+        else:
+            clear_all = all_selected
         if clear_all:
             await storage.set_target_chats(call.from_user.id, [])
             update_message = "Все чаты убраны из списка рассылки."
