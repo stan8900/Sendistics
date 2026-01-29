@@ -853,12 +853,44 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     except ValueError:
         await call.answer("Неизвестная команда", show_alert=True)
         return
+    user_id = call.from_user.id
     if action == "done":
         if origin == "main":
-            await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
+            await send_main_menu(call.message, edit=True, user_id=user_id)
         else:
-            auto_data = await storage.get_auto(call.from_user.id)
-            await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
+            auto_data = await storage.get_auto(user_id)
+            await show_auto_menu(call.message, auto_data, user_id=user_id)
+        return
+    if action == "all":
+        known = await storage.list_known_chats()
+        if not known:
+            await call.answer("Нет доступных групп.", show_alert=True)
+            return
+        auto = await storage.get_auto(user_id)
+        selected_now = set(auto.get("target_chat_ids") or [])
+        all_ids = sorted(int(info["chat_id"]) for info in known.values())
+        if all_ids and len(selected_now) == len(all_ids):
+            await storage.clear_target_chats(user_id)
+            status_line = "Все группы сняты из рассылки."
+        else:
+            await storage.set_target_chats(user_id, all_ids)
+            status_line = "Все группы выбраны для рассылки."
+        await storage.ensure_constraints(
+            user_id=user_id,
+            require_targets=call.bot.get("user_sender") is None,
+        )
+        auto_sender: AutoSender = call.bot["auto_sender"]
+        await auto_sender.refresh_user(user_id)
+        known = await storage.list_known_chats()
+        auto = await storage.get_auto(user_id)
+        reply_text = (
+            "📋 <b>Выбор групп для рассылки</b>\n\n"
+            f"{status_line}\nПри необходимости уточните список или нажмите 'Готово'."
+        )
+        await call.message.edit_text(
+            reply_text,
+            reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
+        )
         return
     try:
         chat_id = int(action)
@@ -868,15 +900,15 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     known = await storage.list_known_chats()
     title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
     title = quote_html(title_raw)
-    selected = await storage.toggle_target_chat(call.from_user.id, chat_id, title_raw)
+    selected = await storage.toggle_target_chat(user_id, chat_id, title_raw)
     await storage.ensure_constraints(
-        user_id=call.from_user.id,
+        user_id=user_id,
         require_targets=call.bot.get("user_sender") is None,
     )
     auto_sender: AutoSender = call.bot["auto_sender"]
-    await auto_sender.refresh_user(call.from_user.id)
+    await auto_sender.refresh_user(user_id)
     known = await storage.list_known_chats()
-    auto = await storage.get_auto(call.from_user.id)
+    auto = await storage.get_auto(user_id)
     reply_text = (
         "📋 <b>Выбор групп для рассылки</b>\n\n"
         f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}\n"

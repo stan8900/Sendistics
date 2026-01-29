@@ -57,6 +57,7 @@ def groups_keyboard(
     origin: str = "auto",
 ) -> InlineKeyboardMarkup:
     selected_set = set(selected_ids)
+    total_known = len(known_chats)
     rows: List[List[InlineKeyboardButton]] = []
     for chat_key, chat_info in sorted(known_chats.items(), key=lambda item: item[1].get("title", "")):
         chat_id = int(chat_key)
@@ -67,6 +68,9 @@ def groups_keyboard(
                 f"{prefix} {title[:48]}", callback_data=f"group:{origin}:{chat_id}"
             )
         ])
+    if total_known:
+        select_all_label = "❎ Снять все" if total_known == len(selected_set) and selected_set else "✅ Выбрать все"
+        rows.append([InlineKeyboardButton(select_all_label, callback_data=f"group:{origin}:all")])
     rows.append([
         InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")
     ])

@@ -136,6 +136,30 @@ class Storage:
             self._commit()
             return True
 
+    async def set_target_chats(self, user_id: int, chat_ids: Iterable[int]) -> None:
+        async with self._lock:
+            self._ensure_user_auto_locked(user_id)
+            ids = []
+            for chat_id in chat_ids:
+                try:
+                    ids.append(int(chat_id))
+                except (TypeError, ValueError):
+                    continue
+            self._execute("DELETE FROM user_auto_targets WHERE user_id = ?", (user_id,))
+            if ids:
+                self._executemany(
+                    """
+                    INSERT INTO user_auto_targets (user_id, chat_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(user_id, chat_id) DO NOTHING
+                    """,
+                    [(user_id, chat_id) for chat_id in ids],
+                )
+            self._commit()
+
+    async def clear_target_chats(self, user_id: int) -> None:
+        await self.set_target_chats(user_id, [])
+
     async def update_stats(self, user_id: int, *, sent: int, errors: List[str]) -> None:
         async with self._lock:
             self._ensure_user_auto_locked(user_id)
