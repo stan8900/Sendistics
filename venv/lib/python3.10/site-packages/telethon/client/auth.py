@@ -19,8 +19,8 @@ class AuthMethods:
 
     def start(
             self: 'TelegramClient',
-            phone: typing.Callable[[], str] = lambda: input('Please enter your phone (or bot token): '),
-            password: typing.Callable[[], str] = lambda: getpass.getpass('Please enter your password: '),
+            phone: typing.Union[typing.Callable[[], str], str] = lambda: input('Please enter your phone (or bot token): '),
+            password: typing.Union[typing.Callable[[], str], str] = lambda: getpass.getpass('Please enter your password: '),
             *,
             bot_token: str = None,
             force_sms: bool = False,
@@ -147,14 +147,16 @@ class AuthMethods:
                 if bot_token[:bot_token.find(':')] != str(me.id):
                     warnings.warn(
                         'the session already had an authorized user so it did '
-                        'not login to the bot account using the provided '
-                        'bot_token (it may not be using the user you expect)'
+                        'not login to the bot account using the provided bot_token; '
+                        'if you were expecting a different user, check whether '
+                        'you are accidentally reusing an existing session'
                     )
             elif phone and not callable(phone) and utils.parse_phone(phone) != me.phone:
                 warnings.warn(
                     'the session already had an authorized user so it did '
-                    'not login to the user account using the provided '
-                    'phone (it may not be using the user you expect)'
+                    'not login to the user account using the provided phone; '
+                    'if you were expecting a different user, check whether '
+                    'you are accidentally reusing an existing session'
                 )
 
             return self
@@ -390,6 +392,16 @@ class AuthMethods:
         self._authorized = True
 
         state = await self(functions.updates.GetStateRequest())
+        # the server may send an old qts in getState
+        difference = await self(functions.updates.GetDifferenceRequest(pts=state.pts, date=state.date, qts=state.qts))
+
+        if isinstance(difference, types.updates.Difference):
+            state = difference.state
+        elif isinstance(difference, types.updates.DifferenceSlice):
+            state = difference.intermediate_state
+        elif isinstance(difference, types.updates.DifferenceTooLong):
+            state.pts = difference.pts
+
         self._message_box.load(SessionState(0, 0, 0, state.pts, state.qts, int(state.date.timestamp()), state.seq, 0), [])
 
         return user
@@ -540,7 +552,7 @@ class AuthMethods:
         self._authorized = False
 
         await self.disconnect()
-        self.session.delete()
+        await utils.maybe_async(self.session.delete())
         self.session = None
         return True
 

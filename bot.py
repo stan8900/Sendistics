@@ -4,7 +4,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -19,6 +19,7 @@ from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboar
 from app.pdf_reports import build_payments_pdf
 from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates, AdminInboxStates
 from app.storage import Storage
+from app.user_delivery import UserDelivery
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -78,20 +79,38 @@ async def safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
     except exceptions.MessageNotModified:
         return
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
-admin_bot_token = os.getenv("ADMIN_BOT_TOKEN")
-if admin_bot_token == BOT_TOKEN:
-    logger.warning("ADMIN_BOT_TOKEN совпадает с токеном основного бота, используем один экземпляр.")
-    admin_bot_token = None
-USE_SEPARATE_DELIVERY_BOT = bool(admin_bot_token)
-if admin_bot_token:
-    delivery_bot = Bot(token=admin_bot_token, parse_mode=types.ParseMode.HTML)
-else:
-    delivery_bot = bot
+tg_user_api_id = os.getenv("TG_USER_API_ID")
+tg_user_api_hash = os.getenv("TG_USER_API_HASH")
+tg_user_session = os.getenv("TG_USER_SESSION")
+user_delivery: Optional[UserDelivery] = None
+try:
+    api_id_value = int(tg_user_api_id) if tg_user_api_id else None
+except ValueError:
+    api_id_value = None
+if api_id_value and tg_user_api_hash and tg_user_session:
+    user_delivery = UserDelivery(
+        api_id=api_id_value,
+        api_hash=tg_user_api_hash,
+        session_string=tg_user_session,
+    )
+USE_USER_DELIVERY = user_delivery is not None
 dp = Dispatcher(bot, storage=MemoryStorage())
 
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
-bot["delivery_bot"] = delivery_bot
+bot["user_delivery"] = user_delivery
+
+
+async def refresh_user_delivery_chats() -> None:
+    if not USE_USER_DELIVERY:
+        return
+    user_delivery_instance: Optional[UserDelivery] = bot.get("user_delivery")
+    if not user_delivery_instance:
+        return
+    try:
+        await user_delivery_instance.sync_known_chats(storage)
+    except Exception:
+        logger.exception("Не удалось обновить список чатов пользовательского клиента.")
 
 PAYMENT_AMOUNT = 100_000
 PAYMENT_CURRENCY = "UZS"
@@ -405,6 +424,8 @@ async def send_main_menu(message: types.Message, *, edit: bool = False, user_id:
 
 
 async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Optional[int] = None) -> None:
+    if USE_USER_DELIVERY:
+        await refresh_user_delivery_chats()
     status = "Активна ✅" if auto_data.get("is_enabled") else "Не запущена"
     message_preview_raw = auto_data.get("message") or "— не задано"
     if len(message_preview_raw) > 180:
@@ -416,6 +437,7 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
     targets = auto_data.get("target_chat_ids") or []
     known_chats = await storage.list_known_chats()
     available_total = sum(1 for info in known_chats.values() if info.get("delivery_available"))
+    agent_name = "пользователя рассылки" if USE_USER_DELIVERY else "бота"
     if targets:
         missing = [
             chat_id
@@ -425,7 +447,7 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
         if missing:
             group_line = (
                 f"⚠️ Выбрано групп: {len(targets)}. "
-                "Добавьте бота-админа во все выбранные чаты."
+                f"Добавьте {agent_name} во все выбранные чаты."
             )
         else:
             group_line = f"Выбрано групп: {len(targets)} из доступных {available_total}"
@@ -433,7 +455,7 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
         if available_total:
             group_line = f"Группы не выбраны (доступно {available_total})"
         else:
-            group_line = "Нет доступных групп: добавьте бота-админа в рабочие чаты."
+            group_line = f"Нет доступных групп: добавьте {agent_name} в рабочие чаты."
     system_payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if system_payment_valid and latest_payment:
@@ -599,15 +621,17 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
+    await refresh_user_delivery_chats()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
     if not known:
+        delivery_subject = "пользователя рассылки" if USE_USER_DELIVERY else "бота"
         text, keyboard, _ = await build_main_menu(call.from_user.id)
         await safe_edit_text(
             call.message,
             "📋 Пока нет групп для рассылки.\n"
-            "Добавьте бота-админа в рабочие чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
+            f"Добавьте {delivery_subject} в рабочие чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
@@ -615,7 +639,7 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопку, чтобы добавить или убрать чат.\n"
         "Используйте «Выбрать все», чтобы отметить все чаты сразу.\n"
-        "🤖 — бот-админ в чате, 🚫 — бот-админ отсутствует (нужно добавить его в группу)."
+        f"🤖 — {'пользователь рассылки' if USE_USER_DELIVERY else 'бот'} в чате, 🚫 — отсутствует (нужно добавить его в группу)."
     )
     await safe_edit_text(
         call.message,
@@ -630,6 +654,7 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
+    await refresh_user_delivery_chats()
     auto = await storage.get_auto()
     interval = auto.get("interval_minutes")
     message_text_raw = auto.get("message") or "— не задано"
@@ -638,6 +663,7 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
     targets = auto.get("target_chat_ids") or []
     known_chats = await storage.list_known_chats()
     available_total = sum(1 for info in known_chats.values() if info.get("delivery_available"))
+    agent_name = "пользователя рассылки" if USE_USER_DELIVERY else "бота"
     if targets:
         missing = [
             chat_id
@@ -645,14 +671,14 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
             if str(chat_id) not in known_chats or not known_chats[str(chat_id)].get("delivery_available")
         ]
         if missing:
-            group_line = "Группы: выбраны недоступные чаты — добавьте бота-админа."
+            group_line = f"Группы: выбраны недоступные чаты — добавьте {agent_name}."
         else:
             group_line = f"Группы: {len(targets)} выбрано (доступно {available_total})"
     else:
         if available_total:
             group_line = f"Группы: не выбраны (доступно {available_total})"
         else:
-            group_line = "Группы: нет доступных чатов — добавьте бота-админа."
+            group_line = f"Группы: нет доступных чатов — добавьте {agent_name}."
     payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
     if payment_valid and latest_payment:
@@ -884,23 +910,27 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     await call.answer()
+    await refresh_user_delivery_chats()
     known = await storage.list_known_chats()
     auto = await storage.get_auto()
     selected = auto.get("target_chat_ids") or []
     if not known:
+        delivery_subject = "пользователя рассылки" if USE_USER_DELIVERY else "бота"
         _, keyboard, _ = await build_main_menu(call.from_user.id)
         await safe_edit_text(
             call.message,
-            "📋 Пока нет групп для рассылки.\nДобавьте бота-админа в рабочие чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
+            "📋 Пока нет групп для рассылки.\n"
+            f"Добавьте {delivery_subject} в рабочие чаты и убедитесь, что он может отправлять сообщения, затем повторите попытку.",
             reply_markup=keyboard,
         )
         return
+    delivery_subject = "пользователь рассылки" if USE_USER_DELIVERY else "бот"
     text = (
         "📋 <b>Выбор групп для рассылки</b>\n"
         "Нажмите на кнопки, чтобы добавить или убрать чат.\n"
         "Если ничего не выбрано, рассылка не запускается.\n"
         "Используйте «Выбрать все», чтобы отметить все чаты сразу.\n"
-        "🤖 — бот-админ в чате, 🚫 — бот-админ отсутствует."
+        f"🤖 — {delivery_subject} в чате, 🚫 — отсутствует."
     )
     await safe_edit_text(
         call.message,
@@ -956,8 +986,9 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             await call.answer("Чат не найден. Обновите список.", show_alert=True)
             return
         if not chat_info.get("delivery_available"):
+            missing_subject = "Пользователь рассылки" if USE_USER_DELIVERY else "Бот"
             await call.answer(
-                "Бот-админ не добавлен в этот чат. Добавьте его и попробуйте снова.",
+                f"{missing_subject} не добавлен в этот чат. Добавьте его и попробуйте снова.",
                 show_alert=True,
             )
             return
@@ -1095,11 +1126,11 @@ async def cb_main_payments_pdf(call: types.CallbackQuery) -> None:
 @dp.callback_query_handler(lambda c: c.data == "auto:start")
 async def cb_auto_start(call: types.CallbackQuery) -> None:
     await call.answer()
+    await refresh_user_delivery_chats()
     auto = await storage.get_auto()
     if not auto.get("message"):
         await call.message.answer("Сначала задайте текст сообщения.")
         return
-    auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
     selected_targets = auto.get("target_chat_ids") or []
     if not selected_targets:
         await call.message.answer("Не выбрано ни одной группы для рассылки.")
@@ -1112,8 +1143,9 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
             (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
             for chat_id in missing_targets
         ]
+        agent_name = "пользователь рассылки" if USE_USER_DELIVERY else "бот"
         await call.message.answer(
-            "Бот-админ не добавлен в следующие группы:\n"
+            f"{agent_name.capitalize()} не добавлен в следующие группы:\n"
             + "\n".join(f"• {title}" for title in titles)
             + "\n\nДобавьте его и попробуйте снова."
         )
@@ -1222,11 +1254,11 @@ async def handle_admin_reply(message: types.Message, state: FSMContext) -> None:
         await state.finish()
 
 
-async def ensure_known_group_chat(chat: types.Chat, *, via_delivery_bot: bool = False) -> None:
+async def ensure_known_group_chat(chat: types.Chat) -> None:
     if chat.type not in GROUP_CHAT_TYPES:
         return
     title = chat.title or chat.full_name or str(chat.id)
-    delivery_ready = via_delivery_bot or not USE_SEPARATE_DELIVERY_BOT
+    delivery_ready = None if USE_USER_DELIVERY else True
     await storage.upsert_known_chat(
         chat.id,
         title,
@@ -1237,8 +1269,6 @@ async def ensure_known_group_chat(chat: types.Chat, *, via_delivery_bot: bool = 
 async def apply_chat_membership_update(
     chat: types.Chat,
     status: str,
-    *,
-    via_delivery_bot: bool = False,
 ) -> None:
     if chat.type not in GROUP_CHAT_TYPES:
         return
@@ -1247,28 +1277,24 @@ async def apply_chat_membership_update(
         types.ChatMemberStatus.CREATOR,
         types.ChatMemberStatus.MEMBER,
     ):
-        await ensure_known_group_chat(chat, via_delivery_bot=via_delivery_bot)
+        await ensure_known_group_chat(chat)
         logger.info("Добавлен чат %s (%s)", chat.id, chat.title or chat.full_name or str(chat.id))
     elif status in (
         types.ChatMemberStatus.LEFT,
         types.ChatMemberStatus.KICKED,
         types.ChatMemberStatus.RESTRICTED,
     ):
-        if via_delivery_bot:
+        if USE_USER_DELIVERY:
             await storage.set_delivery_available(chat.id, False)
-            logger.info("Бот-админ исключён из чата %s", chat.id)
+            logger.info("Основной бот покинул чат %s. Он останется в списке, если пользователь клиент присутствует.", chat.id)
         else:
-            delivery_available = await storage.is_delivery_available(chat.id)
-            if USE_SEPARATE_DELIVERY_BOT and delivery_available:
-                logger.info("Основной бот покинул чат %s, но бот-админ остаётся.", chat.id)
-            else:
-                await storage.remove_known_chat(chat.id)
-                logger.info("Удалён чат %s", chat.id)
+            await storage.remove_known_chat(chat.id)
+            logger.info("Удалён чат %s", chat.id)
 
 
 @dp.my_chat_member_handler()
 async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
-    await apply_chat_membership_update(update.chat, update.new_chat_member.status, via_delivery_bot=False)
+    await apply_chat_membership_update(update.chat, update.new_chat_member.status)
 
 
 @dp.message_handler(content_types=types.ContentTypes.TEXT, chat_type=[types.ChatType.GROUP, types.ChatType.SUPERGROUP])
@@ -1289,93 +1315,27 @@ async def handle_group_text(message: types.Message) -> None:
         await ensure_known_group_chat(chat)
 
 
-async def refresh_delivery_availability(bot_instance: Bot) -> None:
-    known = await storage.list_known_chats()
-    if not known:
-        return
-    try:
-        me = await bot_instance.get_me()
-    except exceptions.TelegramAPIError as exc:
-        logger.warning("Админ-бот: не удалось получить информацию о себе: %s", exc)
-        return
-    allowed_statuses = {
-        types.ChatMemberStatus.ADMINISTRATOR,
-        types.ChatMemberStatus.CREATOR,
-        types.ChatMemberStatus.MEMBER,
-    }
-    for chat_key, info in known.items():
-        chat_id = int(chat_key)
-        try:
-            member = await bot_instance.get_chat_member(chat_id, me.id)
-        except exceptions.TelegramAPIError as exc:
-            await storage.set_delivery_available(chat_id, False)
-            logger.info("Админ-бот: чат %s недоступен (%s)", chat_id, exc)
-            continue
-        await storage.set_delivery_available(chat_id, member.status in allowed_statuses)
-
-
-async def admin_bot_updates_listener(bot_instance: Bot, stop_event: asyncio.Event) -> None:
-    offset = 0
-    allowed_updates = ["my_chat_member", "message"]
-    logger.info("Админ-бот: отслеживание групп запущено.")
-    while not stop_event.is_set():
-        try:
-            updates = await bot_instance.get_updates(
-                offset=offset,
-                timeout=30,
-                allowed_updates=allowed_updates,
-            )
-        except exceptions.TerminatedByOtherGetUpdates:
-            logger.warning("Админ-бот: найдены параллельные getUpdates. Повтор через 5 с.")
-            await asyncio.sleep(5)
-            continue
-        except exceptions.TelegramAPIError as exc:
-            logger.error("Админ-бот: ошибка получения обновлений: %s", exc)
-            await asyncio.sleep(5)
-            continue
-        except Exception:
-            logger.exception("Админ-бот: неожиданный сбой обновлений.")
-            await asyncio.sleep(5)
-            continue
-        for update in updates:
-            offset = update.update_id + 1
-            if update.my_chat_member:
-                await apply_chat_membership_update(
-                    update.my_chat_member.chat,
-                    update.my_chat_member.new_chat_member.status,
-                    via_delivery_bot=True,
-                )
-            elif update.message and update.message.chat.type in GROUP_CHAT_TYPES:
-                await ensure_known_group_chat(update.message.chat, via_delivery_bot=True)
-        if not updates:
-            continue
-    logger.info("Админ-бот: отслеживание групп остановлено.")
-
-
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
-    delivery_bot_instance: Bot = dispatcher.bot.get("delivery_bot") or dispatcher.bot
+    mtproto_delivery: Optional[UserDelivery] = dispatcher.bot.get("user_delivery")
+
+    async def send_via_bot(chat_id: int, text: str) -> None:
+        await dispatcher.bot.send_message(chat_id, text)
+
+    send_callable: Callable[[int, str], Awaitable[None]] = send_via_bot
+    if mtproto_delivery:
+        await mtproto_delivery.start()
+        await mtproto_delivery.sync_known_chats(storage)
+        send_callable = mtproto_delivery.send_text
     auto_sender = AutoSender(
-        delivery_bot_instance,
+        send_callable,
         storage,
         PAYMENT_VALID_DAYS,
     )
     dispatcher.bot["auto_sender"] = auto_sender
-    if delivery_bot_instance is not dispatcher.bot and not dispatcher.bot.get("admin_listener_task"):
-        try:
-            await delivery_bot_instance.delete_webhook(drop_pending_updates=False)
-        except exceptions.TelegramAPIError as exc:
-            logger.warning("Админ-бот: не удалось снять webhook перед polling: %s", exc)
-        stop_event = asyncio.Event()
-        dispatcher.bot["admin_listener_stop"] = stop_event
-    dispatcher.bot["admin_listener_task"] = asyncio.create_task(
-        admin_bot_updates_listener(delivery_bot_instance, stop_event)
-    )
     dispatcher.bot["bot_id"] = me.id
     await storage.ensure_constraints()
-    if USE_SEPARATE_DELIVERY_BOT:
-        await refresh_delivery_availability(delivery_bot_instance)
-    else:
+    if not mtproto_delivery:
         await storage.mark_all_chats_delivery_available()
     await auto_sender.start_if_enabled()
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
@@ -1385,18 +1345,9 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     auto_sender: Optional[AutoSender] = dispatcher.bot.get("auto_sender")
     if auto_sender:
         await auto_sender.stop()
-    stop_event: Optional[asyncio.Event] = dispatcher.bot.get("admin_listener_stop")
-    listener_task: Optional[asyncio.Task] = dispatcher.bot.get("admin_listener_task")
-    if stop_event:
-        stop_event.set()
-    if listener_task:
-        try:
-            await listener_task
-        except Exception:
-            logger.exception("Админ-бот: ошибка при остановке слушателя.")
-    delivery_bot_instance: Bot = dispatcher.bot.get("delivery_bot") or dispatcher.bot
-    if delivery_bot_instance is not dispatcher.bot:
-        await delivery_bot_instance.session.close()
+    mtproto_delivery: Optional[UserDelivery] = dispatcher.bot.get("user_delivery")
+    if mtproto_delivery:
+        await mtproto_delivery.stop()
     await dispatcher.storage.close()
     await dispatcher.storage.wait_closed()
 

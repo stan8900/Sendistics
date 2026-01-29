@@ -1,8 +1,7 @@
 import asyncio
 import logging
-from typing import List
+from typing import Awaitable, Callable, List
 
-from aiogram import Bot
 from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
 
 from .storage import Storage
@@ -11,11 +10,11 @@ from .storage import Storage
 class AutoSender:
     def __init__(
         self,
-        bot: Bot,
+        send_message: Callable[[int, str], Awaitable[None]],
         storage: Storage,
         payment_valid_days: int,
     ) -> None:
-        self._bot = bot
+        self._send_message = send_message
         self._storage = storage
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
@@ -83,7 +82,7 @@ class AutoSender:
             errors: List[str] = []
             for chat_id in targets:
                 try:
-                    await self._bot.send_message(chat_id, message)
+                    await self._send_message(chat_id, message)
                     success += 1
                 except (BotKicked, ChatNotFound, Unauthorized) as exc:
                     errors.append(f"Недоступен чат {chat_id}: {exc}")
