@@ -1035,12 +1035,16 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             await call.answer("Чат не найден. Обновите список.", show_alert=True)
             return
         if not chat_info.get("delivery_available"):
-            missing_subject = "Пользователь рассылки" if USE_USER_DELIVERY else "Бот"
-            await call.answer(
-                f"{missing_subject} не добавлен в этот чат. Добавьте его и попробуйте снова.",
-                show_alert=True,
-            )
-            return
+            await refresh_user_delivery_chats()
+            known = await storage.list_known_chats()
+            chat_info = known.get(str(chat_id))
+            if not chat_info or not chat_info.get("delivery_available"):
+                missing_subject = "Пользователь рассылки" if USE_USER_DELIVERY else "Бот"
+                await call.answer(
+                    f"{missing_subject} не добавлен в этот чат. Добавьте его и попробуйте снова.",
+                    show_alert=True,
+                )
+                return
         title_raw = chat_info.get("title") or str(chat_id)
         title = quote_html(title_raw)
         selected = await storage.toggle_target_chat(call.from_user.id, chat_id, title_raw)
