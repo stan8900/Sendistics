@@ -18,10 +18,13 @@ class UserDelivery:
         api_id: int,
         api_hash: str,
         session_string: str,
-        dialogs_limit: int = 200,
+        dialogs_limit: Optional[int] = None,
     ) -> None:
         self._client = TelegramClient(StringSession(session_string), api_id, api_hash)
-        self._dialogs_limit = max(1, dialogs_limit)
+        if dialogs_limit is not None:
+            self._dialogs_limit: Optional[int] = max(1, dialogs_limit)
+        else:
+            self._dialogs_limit = None
         self._logger = logging.getLogger(__name__)
         self._lock = asyncio.Lock()
         self._sync_lock = asyncio.Lock()
@@ -53,9 +56,9 @@ class UserDelivery:
         if not self._connected:
             raise RuntimeError("TD user client is not running.")
         async with self._sync_lock:
-            dialogs = await self._client.get_dialogs(limit=self._dialogs_limit)
+            dialogs_iter = self._client.iter_dialogs(limit=self._dialogs_limit)
             available_ids: Set[int] = set()
-            for dialog in dialogs:
+            async for dialog in dialogs_iter:
                 entity = dialog.entity
                 chat_id = self._extract_group_id(entity)
                 if chat_id is None:

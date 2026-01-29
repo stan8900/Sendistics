@@ -82,6 +82,17 @@ bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 tg_user_api_id = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
 tg_user_session = os.getenv("TG_USER_SESSION")
+tg_user_dialogs_limit_raw = os.getenv("TG_USER_DIALOGS_LIMIT")
+tg_user_dialogs_limit: Optional[int] = None
+if tg_user_dialogs_limit_raw:
+    try:
+        tg_user_dialogs_limit_value = int(tg_user_dialogs_limit_raw)
+    except ValueError:
+        logger.warning("Некорректное значение TG_USER_DIALOGS_LIMIT: %s", tg_user_dialogs_limit_raw)
+    else:
+        if tg_user_dialogs_limit_value > 0:
+            tg_user_dialogs_limit = tg_user_dialogs_limit_value
+
 user_delivery: Optional[UserDelivery] = None
 try:
     api_id_value = int(tg_user_api_id) if tg_user_api_id else None
@@ -92,6 +103,7 @@ if api_id_value and tg_user_api_hash and tg_user_session:
         api_id=api_id_value,
         api_hash=tg_user_api_hash,
         session_string=tg_user_session,
+        dialogs_limit=tg_user_dialogs_limit,
     )
 USE_USER_DELIVERY = user_delivery is not None
 dp = Dispatcher(bot, storage=MemoryStorage())
