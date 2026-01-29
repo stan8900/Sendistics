@@ -61,7 +61,8 @@ def groups_keyboard(
     selected_set = set(selected_ids)
     rows: List[List[InlineKeyboardButton]] = []
     sorted_items = [
-        (int(chat_key), info) for chat_key, info in sorted(known_chats.items(), key=lambda item: item[1].get("title", ""))
+        (int(chat_key), info)
+        for chat_key, info in sorted(known_chats.items(), key=lambda item: item[1].get("title", ""))
     ]
     total = len(sorted_items)
     if total == 0:
@@ -77,7 +78,8 @@ def groups_keyboard(
     end = start + page_size
     page_items = sorted_items[start:end]
     chat_ids = [chat_id for chat_id, _ in sorted_items]
-    all_selected = bool(chat_ids) and all(chat_id in selected_set for chat_id in chat_ids)
+    available_chat_ids = [chat_id for chat_id, info in sorted_items if info.get("delivery_available")]
+    all_selected = bool(available_chat_ids) and all(chat_id in selected_set for chat_id in available_chat_ids)
     for chat_id, chat_info in page_items:
         title = chat_info.get("title") or f"Чат {chat_id}"
         prefix = "✅" if chat_id in selected_set else "➕"
@@ -92,7 +94,12 @@ def groups_keyboard(
         )
     toggle_label = "➖ Снять выделение" if all_selected else "✅ Выбрать все"
     rows.append(
-        [InlineKeyboardButton(toggle_label, callback_data=f"group:{origin}:all|{current_page}")]
+        [
+            InlineKeyboardButton(
+                toggle_label,
+                callback_data=f"group:{origin}:all|{current_page}|{'clear' if all_selected else 'fill'}",
+            )
+        ]
     )
     nav_row: List[InlineKeyboardButton] = []
     if current_page > 0:

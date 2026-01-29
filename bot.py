@@ -953,11 +953,14 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     action_parts = action_raw.split("|")
     action = action_parts[0]
     page = 0
+    mode: Optional[str] = None
     if len(action_parts) > 1:
         try:
             page = int(action_parts[1])
         except ValueError:
             page = 0
+    if len(action_parts) > 2:
+        mode = action_parts[2]
     if action == "done":
         if origin == "main":
             await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
@@ -988,11 +991,13 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         if not available_ids:
             await call.answer("Нет доступных чатов.", show_alert=True)
             return
-        auto_data = await storage.get_auto(call.from_user.id)
-        known_set = set(available_ids)
-        current_targets = set(auto_data.get("target_chat_ids") or [])
-        select_all = bool(known_set) and known_set.issubset(current_targets)
-        if select_all:
+        clear_all = mode == "clear"
+        if mode is None:
+            auto_data = await storage.get_auto(call.from_user.id)
+            known_set = set(available_ids)
+            current_targets = set(auto_data.get("target_chat_ids") or [])
+            clear_all = bool(known_set) and known_set.issubset(current_targets)
+        if clear_all:
             await storage.set_target_chats(call.from_user.id, [])
             update_message = "Все чаты убраны из списка рассылки."
         else:
