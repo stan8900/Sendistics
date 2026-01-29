@@ -358,7 +358,7 @@ async def send_main_menu(message: types.Message, *, edit: bool = False, user_id:
         await message.answer(text, reply_markup=keyboard)
 
 
-async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Optional[int] = None) -> None:
+async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: int) -> None:
     status = "Активна ✅" if auto_data.get("is_enabled") else "Не запущена"
     message_preview_raw = auto_data.get("message") or "— не задано"
     if len(message_preview_raw) > 180:
@@ -386,25 +386,23 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: Op
     else:
         system_payment_line = f"Общая оплата: требуется пополнение (каждые {PAYMENT_VALID_DAYS} дней)"
     payment_lines = []
-    is_admin = None
-    if user_id is not None:
-        is_admin = await is_admin_user(user_id)
-        personal_valid = await storage.has_recent_payment_for_user(user_id, within_days=PAYMENT_VALID_DAYS)
-        if personal_valid:
-            personal_ts = await storage.latest_payment_timestamp_for_user(user_id)
-            if personal_ts:
-                personal_expires = personal_ts + timedelta(days=PAYMENT_VALID_DAYS)
-                payment_lines.append(f"Ваша оплата: активна до {personal_expires.strftime('%d.%m.%Y')} ✅")
-            else:
-                payment_lines.append("Ваша оплата: подтверждена ✅")
+    is_admin = await is_admin_user(user_id)
+    personal_valid = await storage.has_recent_payment_for_user(user_id, within_days=PAYMENT_VALID_DAYS)
+    if personal_valid:
+        personal_ts = await storage.latest_payment_timestamp_for_user(user_id)
+        if personal_ts:
+            personal_expires = personal_ts + timedelta(days=PAYMENT_VALID_DAYS)
+            payment_lines.append(f"Ваша оплата: активна до {personal_expires.strftime('%d.%m.%Y')} ✅")
         else:
-            payment_lines.append(
-                "Ваша оплата: не найдена или просрочена. Пополните баланс и дождитесь подтверждения. "
-                "Если платеж уже был, попросите администратора нажать «🔁 Перепроверить оплату»."
-            )
-    if is_admin or user_id is None:
+            payment_lines.append("Ваша оплата: подтверждена ✅")
+    else:
+        payment_lines.append(
+            "Ваша оплата: не найдена или просрочена. Пополните баланс и дождитесь подтверждения. "
+            "Если платеж уже был, попросите администратора нажать «🔁 Перепроверить оплату»."
+        )
+    if is_admin:
         payment_lines.append(system_payment_line)
-    payment_line = "\n".join(payment_lines) if payment_lines else system_payment_line
+    payment_line = "\n".join(payment_lines)
     text = (
         f"🛠 {hbold('Авторассылка')}\n\n"
         f"Статус: {status}\n"
@@ -490,7 +488,7 @@ async def process_admin_code(message: types.Message, state: FSMContext) -> None:
 @dp.callback_query_handler(lambda c: c.data == "main:auto")
 async def cb_main_auto(call: types.CallbackQuery) -> None:
     await call.answer()
-    auto_data = await storage.get_auto()
+    auto_data = await storage.get_auto(call.from_user.id)
     await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
 
 
@@ -500,7 +498,7 @@ async def cb_main_stats(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
-    auto = await storage.get_auto()
+    auto = await storage.get_auto(call.from_user.id)
     stats = auto.get("stats") or {}
     sent_total = stats.get("sent_total", 0)
     last_sent_at = stats.get("last_sent_at")
@@ -548,7 +546,7 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         return
     await call.answer()
     known = await storage.list_known_chats()
-    auto = await storage.get_auto()
+    auto = await storage.get_auto(call.from_user.id)
     selected = auto.get("target_chat_ids") or []
     if not known:
         text, keyboard, _ = await build_main_menu(call.from_user.id)
@@ -574,7 +572,7 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
-    auto = await storage.get_auto()
+    auto = await storage.get_auto(call.from_user.id)
     interval = auto.get("interval_minutes")
     message_text_raw = auto.get("message") or "— не задано"
     message_text = quote_html(message_text_raw)
@@ -689,20 +687,20 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
     if not text:
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
         return
-    await storage.set_auto_message(text)
-    await storage.ensure_constraints(require_targets=message.bot.get("user_sender") is None)
+    await storage.set_auto_message(message.from_user.id, text)
+    await storage.ensure_constraints(user_id=message.from_user.id, require_targets=message.bot.get("user_sender") is None)
     auto_sender: AutoSender = message.bot["auto_sender"]
-    await auto_sender.refresh()
+    await auto_sender.refresh_user(message.from_user.id)
     await state.finish()
     await message.answer("Сообщение сохранено.")
-    auto_data = await storage.get_auto()
+    auto_data = await storage.get_auto(message.from_user.id)
     await message.answer(
         "Параметры авторассылки обновлены.",
-        reply_markup=auto_menu_keyboard(
-            is_enabled=auto_data.get("is_enabled"),
-            allow_group_pick=message.bot.get("user_sender") is None,
-        ),
-    )
+            reply_markup=auto_menu_keyboard(
+                is_enabled=auto_data.get("is_enabled"),
+                allow_group_pick=message.bot.get("user_sender") is None,
+            ),
+        )
 
 
 @dp.callback_query_handler(lambda c: c.data == "auto:set_interval")
@@ -725,13 +723,13 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
     if minutes <= 0:
         await message.reply("Интервал должен быть больше нуля.")
         return
-    await storage.set_auto_interval(minutes)
-    await storage.ensure_constraints(require_targets=message.bot.get("user_sender") is None)
+    await storage.set_auto_interval(message.from_user.id, minutes)
+    await storage.ensure_constraints(user_id=message.from_user.id, require_targets=message.bot.get("user_sender") is None)
     auto_sender: AutoSender = message.bot["auto_sender"]
-    await auto_sender.refresh()
+    await auto_sender.refresh_user(message.from_user.id)
     await state.finish()
     await message.answer(f"Интервал установлен: {minutes} мин.")
-    auto_data = await storage.get_auto()
+    auto_data = await storage.get_auto(message.from_user.id)
     await message.answer(
         "Параметры авторассылки обновлены.",
         reply_markup=auto_menu_keyboard(
@@ -825,7 +823,7 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
         return
     await call.answer()
     known = await storage.list_known_chats()
-    auto = await storage.get_auto()
+    auto = await storage.get_auto(call.from_user.id)
     selected = auto.get("target_chat_ids") or []
     if not known:
         _, keyboard, _ = await build_main_menu(call.from_user.id)
@@ -859,7 +857,7 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         if origin == "main":
             await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
         else:
-            auto_data = await storage.get_auto()
+            auto_data = await storage.get_auto(call.from_user.id)
             await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
         return
     try:
@@ -870,12 +868,15 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     known = await storage.list_known_chats()
     title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
     title = quote_html(title_raw)
-    selected = await storage.toggle_target_chat(chat_id, title_raw)
-    await storage.ensure_constraints(require_targets=call.bot.get("user_sender") is None)
+    selected = await storage.toggle_target_chat(call.from_user.id, chat_id, title_raw)
+    await storage.ensure_constraints(
+        user_id=call.from_user.id,
+        require_targets=call.bot.get("user_sender") is None,
+    )
     auto_sender: AutoSender = call.bot["auto_sender"]
-    await auto_sender.refresh()
+    await auto_sender.refresh_user(call.from_user.id)
     known = await storage.list_known_chats()
-    auto = await storage.get_auto()
+    auto = await storage.get_auto(call.from_user.id)
     reply_text = (
         "📋 <b>Выбор групп для рассылки</b>\n\n"
         f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}\n"
@@ -928,8 +929,8 @@ async def cb_manual_payment_decision(call: types.CallbackQuery) -> None:
     admin_text = build_payment_admin_text(updated)
     await call.message.edit_text("Перепроверка завершена:\n\n" + admin_text)
     auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-    if auto_sender:
-        await auto_sender.refresh()
+    if auto_sender and user_id:
+        await auto_sender.refresh_user(user_id)
     await call.answer("Решение сохранено.")
 
 
@@ -1000,7 +1001,7 @@ async def cb_main_payments_pdf(call: types.CallbackQuery) -> None:
 @dp.callback_query_handler(lambda c: c.data == "auto:start")
 async def cb_auto_start(call: types.CallbackQuery) -> None:
     await call.answer()
-    auto = await storage.get_auto()
+    auto = await storage.get_auto(call.from_user.id)
     if not auto.get("message"):
         await call.message.answer("Сначала задайте текст сообщения.")
         return
@@ -1031,22 +1032,22 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
             f"Для запуска авторассылки необходимо актуальное пополнение баланса за последние {PAYMENT_VALID_DAYS} дней."
         )
         return
-    await storage.set_auto_enabled(True)
+    await storage.set_auto_enabled(call.from_user.id, True)
     auto_sender: AutoSender = call.bot["auto_sender"]
-    await auto_sender.ensure_running()
+    await auto_sender.refresh_user(call.from_user.id)
     await call.message.answer("Авторассылка запущена.")
-    updated = await storage.get_auto()
+    updated = await storage.get_auto(call.from_user.id)
     await show_auto_menu(call.message, updated, user_id=call.from_user.id)
 
 
 @dp.callback_query_handler(lambda c: c.data == "auto:stop")
 async def cb_auto_stop(call: types.CallbackQuery) -> None:
     await call.answer()
-    await storage.set_auto_enabled(False)
+    await storage.set_auto_enabled(call.from_user.id, False)
     auto_sender: AutoSender = call.bot["auto_sender"]
-    await auto_sender.stop()
+    await auto_sender.stop_user(call.from_user.id)
     await call.message.answer("Авторассылка остановлена.")
-    updated = await storage.get_auto()
+    updated = await storage.get_auto(call.from_user.id)
     await show_auto_menu(call.message, updated, user_id=call.from_user.id)
 
 
@@ -1126,7 +1127,10 @@ async def on_startup(dispatcher: Dispatcher) -> None:
     if user_sender_instance:
         await auto_sender.get_personal_chats(refresh=True)
     dispatcher.bot["bot_id"] = me.id
-    await storage.ensure_constraints(require_targets=dispatcher.bot.get("user_sender") is None)
+    await storage.ensure_constraints(
+        user_id=None,
+        require_targets=dispatcher.bot.get("user_sender") is None,
+    )
     await auto_sender.start_if_enabled()
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
 
@@ -1134,7 +1138,7 @@ async def on_startup(dispatcher: Dispatcher) -> None:
 async def on_shutdown(dispatcher: Dispatcher) -> None:
     auto_sender: Optional[AutoSender] = dispatcher.bot.get("auto_sender")
     if auto_sender:
-        await auto_sender.stop()
+        await auto_sender.stop_all()
     user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
     if user_sender_instance:
         await user_sender_instance.stop()
