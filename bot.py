@@ -644,7 +644,7 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
     await safe_edit_text(
         call.message,
         header,
-        reply_markup=groups_keyboard(known, selected, origin="main"),
+        reply_markup=groups_keyboard(known, selected, origin="main", page=0),
     )
 
 
@@ -935,7 +935,7 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     await safe_edit_text(
         call.message,
         text,
-        reply_markup=groups_keyboard(known, selected, origin="auto"),
+        reply_markup=groups_keyboard(known, selected, origin="auto", page=0),
     )
 
 
@@ -943,16 +943,36 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
     await call.answer()
     try:
-        _, origin, action = call.data.split(":", maxsplit=2)
+        _, origin, action_raw = call.data.split(":", maxsplit=2)
     except ValueError:
         await call.answer("Неизвестная команда", show_alert=True)
         return
+    action_parts = action_raw.split("|")
+    action = action_parts[0]
+    page = 0
+    if len(action_parts) > 1:
+        try:
+            page = int(action_parts[1])
+        except ValueError:
+            page = 0
     if action == "done":
         if origin == "main":
             await send_main_menu(call.message, edit=True, user_id=call.from_user.id)
         else:
             auto_data = await storage.get_auto()
             await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
+        return
+    if action == "noop":
+        await call.answer()
+        return
+    if action == "page":
+        known = await storage.list_known_chats()
+        auto = await storage.get_auto()
+        await safe_edit_text(
+            call.message,
+            call.message.text or "",
+            reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin, page=page),
+        )
         return
     known = await storage.list_known_chats()
     update_message: str
@@ -976,8 +996,11 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             await storage.set_target_chats(available_ids)
             update_message = "Все доступные чаты добавлены в рассылку."
     else:
+        if len(action_parts) < 3:
+            await call.answer("Некорректные данные.", show_alert=True)
+            return
         try:
-            chat_id = int(action)
+            chat_id = int(action_parts[2])
         except ValueError:
             await call.answer("Некорректный идентификатор чата", show_alert=True)
             return
@@ -1009,7 +1032,7 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     await safe_edit_text(
         call.message,
         reply_text,
-        reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
+        reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin, page=page),
     )
 
 
