@@ -946,36 +946,16 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         if not known:
             await call.answer("Нет доступных групп.", show_alert=True)
             return
-        sorted_items = sorted(known.items(), key=lambda item: item[1].get("title", ""))
-        total_pages = max(1, (len(sorted_items) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
-        if page >= total_pages:
-            page = total_pages - 1
-        start = page * GROUPS_PAGE_SIZE
-        end = start + GROUPS_PAGE_SIZE
-        page_items = sorted_items[start:end]
-        if not page_items:
-            await call.answer("Нет групп на этой странице.", show_alert=True)
-            return
-        page_ids = [int(chat_id) for chat_id, _ in page_items]
-        auto = await storage.get_auto(user_id)
-        selected_now = list(auto.get("target_chat_ids") or [])
         if action == "clear_all":
-            updated = [chat_id for chat_id in selected_now if chat_id not in page_ids]
-            status_line = "Группы страницы убраны из рассылки."
+            await storage.clear_target_chats(user_id)
+            status_line = "Все группы сняты из рассылки."
         else:
-            existing_set = set(selected_now)
-            updated = list(selected_now)
-            added = False
-            for chat_id in page_ids:
-                if chat_id not in existing_set:
-                    updated.append(chat_id)
-                    existing_set.add(chat_id)
-                    added = True
-            if not added and existing_set.intersection(page_ids):
-                status_line = "Все чаты на странице уже выбраны."
-            else:
-                status_line = "Группы страницы добавлены в рассылку."
-        await storage.set_target_chats(user_id, updated)
+            all_ids = sorted(int(info["chat_id"]) for info in known.values())
+            if not all_ids:
+                await call.answer("Нет групп для выбора.", show_alert=True)
+                return
+            await storage.set_target_chats(user_id, all_ids)
+            status_line = "Все группы выбраны для рассылки."
         await storage.ensure_constraints(
             user_id=user_id,
             require_targets=call.bot.get("user_sender") is None,
