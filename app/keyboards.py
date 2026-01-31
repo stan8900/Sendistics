@@ -1,7 +1,9 @@
+import math
 from typing import Dict, Iterable, List
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+GROUPS_PAGE_SIZE = 8
 
 def main_menu_keyboard(is_admin: bool, *, allow_group_pick: bool) -> InlineKeyboardMarkup:
     if is_admin:
@@ -55,25 +57,52 @@ def groups_keyboard(
     selected_ids: Iterable[int],
     *,
     origin: str = "auto",
+    page: int = 0,
+    per_page: int = GROUPS_PAGE_SIZE,
 ) -> InlineKeyboardMarkup:
     selected_set = set(selected_ids)
-    total_known = len(known_chats)
+    sorted_items = sorted(known_chats.items(), key=lambda item: item[1].get("title", ""))
+    total_known = len(sorted_items)
+    per_page = max(1, per_page)
+    total_pages = max(1, math.ceil(total_known / per_page)) if total_known else 1
+    current_page = max(0, min(page, total_pages - 1))
+    start = current_page * per_page
+    end = start + per_page
+    visible_items = sorted_items[start:end]
     rows: List[List[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        prev_page = max(0, current_page - 1)
+        next_page = min(total_pages - 1, current_page + 1)
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️" if current_page > 0 else "—",
+                callback_data=f"group:{origin}:{'page' if current_page > 0 else 'noop'}:{prev_page}",
+            ),
+            InlineKeyboardButton(
+                f"{current_page + 1}/{total_pages}",
+                callback_data=f"group:{origin}:noop:{current_page}",
+            ),
+            InlineKeyboardButton(
+                "➡️" if current_page < total_pages - 1 else "—",
+                callback_data=f"group:{origin}:{'page' if current_page < total_pages - 1 else 'noop'}:{next_page}",
+            ),
+        ])
     if total_known:
         rows.append([
-            InlineKeyboardButton("✅ Выбрать все", callback_data=f"group:{origin}:select_all"),
-            InlineKeyboardButton("❎ Снять все", callback_data=f"group:{origin}:clear_all"),
+            InlineKeyboardButton("✅ Выбрать все", callback_data=f"group:{origin}:select_all:{current_page}"),
+            InlineKeyboardButton("❎ Снять все", callback_data=f"group:{origin}:clear_all:{current_page}"),
         ])
-    for chat_key, chat_info in sorted(known_chats.items(), key=lambda item: item[1].get("title", "")):
+    for chat_key, chat_info in visible_items:
         chat_id = int(chat_key)
         title = chat_info.get("title") or f"Чат {chat_id}"
         prefix = "✅" if chat_id in selected_set else "➕"
         rows.append([
             InlineKeyboardButton(
-                f"{prefix} {title[:48]}", callback_data=f"group:{origin}:{chat_id}"
+                f"{prefix} {title[:48]}",
+                callback_data=f"group:{origin}:chat:{chat_id}:{current_page}",
             )
         ])
     rows.append([
-        InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done")
+        InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done:{current_page}")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)

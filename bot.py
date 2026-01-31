@@ -15,7 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from dotenv import load_dotenv
 
 from app.auto_sender import AutoSender
-from app.keyboards import auto_menu_keyboard, groups_keyboard, main_menu_keyboard
+from app.keyboards import GROUPS_PAGE_SIZE, auto_menu_keyboard, groups_keyboard, main_menu_keyboard
 from app.pdf_reports import build_payments_pdf
 from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
 from app.storage import Storage
@@ -124,6 +124,11 @@ WELCOME_TEXT_USER = (
     f"💰 Пополнить баланс — отправьте данные оплаты на карту {PAYMENT_CARD_TARGET}.\n"
     "📜 История оплат — проверьте статус заявок и срок подписки.\n\n"
     "Если вы оператор, используйте команду /admin и введите код доступа."
+)
+
+GROUPS_BASE_TEXT = (
+    "📋 <b>Выбор групп для рассылки</b>\n"
+    "Нажмите на кнопки, чтобы добавить или убрать чат."
 )
 
 STATIC_ADMIN_IDS: Set[int] = {
@@ -580,14 +585,16 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
             reply_markup=keyboard,
         )
         return
-    header = (
-        "📋 <b>Выбор групп для рассылки</b>\n"
-        "Нажмите на кнопку, чтобы добавить или убрать чат."
-    )
     await safe_edit_text(
         call.message,
-        header,
-        reply_markup=groups_keyboard(known, selected, origin="main"),
+        GROUPS_BASE_TEXT,
+        reply_markup=groups_keyboard(
+            known,
+            selected,
+            origin="main",
+            page=0,
+            per_page=GROUPS_PAGE_SIZE,
+        ),
     )
 
 
@@ -874,26 +881,31 @@ async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
             reply_markup=keyboard,
         )
         return
-    text = (
-        "📋 <b>Выбор групп для рассылки</b>\n"
-        "Нажмите на кнопки, чтобы добавить или убрать чат."
-    )
     await safe_edit_text(
         call.message,
-        text,
-        reply_markup=groups_keyboard(known, selected, origin="auto"),
+        GROUPS_BASE_TEXT,
+        reply_markup=groups_keyboard(
+            known,
+            selected,
+            origin="auto",
+            page=0,
+            per_page=GROUPS_PAGE_SIZE,
+        ),
     )
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("group:"))
 async def cb_group_toggle(call: types.CallbackQuery) -> None:
     await call.answer()
-    try:
-        _, origin, action = call.data.split(":", maxsplit=2)
-    except ValueError:
+    parts = call.data.split(":")
+    if len(parts) < 3:
         await call.answer("Неизвестная команда", show_alert=True)
         return
+    _, origin, action, *extra = parts
+    page = 0
     user_id = call.from_user.id
+    if action == "noop":
+        return
     if action == "done":
         if origin == "main":
             await send_main_menu(call.message, edit=True, user_id=user_id)
@@ -901,22 +913,69 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             auto_data = await storage.get_auto(user_id)
             await show_auto_menu(call.message, auto_data, user_id=user_id)
         return
-    if action in {"select_all", "clear_all"}:
+    if action == "page":
+        if extra:
+            try:
+                page = max(0, int(extra[0]))
+            except ValueError:
+                page = 0
         known = await storage.list_known_chats()
         if not known:
             await call.answer("Нет доступных групп.", show_alert=True)
             return
         auto = await storage.get_auto(user_id)
+        await safe_edit_text(
+            call.message,
+            GROUPS_BASE_TEXT,
+            reply_markup=groups_keyboard(
+                known,
+                auto.get("target_chat_ids"),
+                origin=origin,
+                page=page,
+                per_page=GROUPS_PAGE_SIZE,
+            ),
+        )
+        return
+    if action in {"select_all", "clear_all"}:
+        if extra:
+            try:
+                page = max(0, int(extra[0]))
+            except ValueError:
+                page = 0
+        known = await storage.list_known_chats()
+        if not known:
+            await call.answer("Нет доступных групп.", show_alert=True)
+            return
+        sorted_items = sorted(known.items(), key=lambda item: item[1].get("title", ""))
+        total_pages = max(1, (len(sorted_items) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+        if page >= total_pages:
+            page = total_pages - 1
+        start = page * GROUPS_PAGE_SIZE
+        end = start + GROUPS_PAGE_SIZE
+        page_items = sorted_items[start:end]
+        if not page_items:
+            await call.answer("Нет групп на этой странице.", show_alert=True)
+            return
+        page_ids = [int(chat_id) for chat_id, _ in page_items]
+        auto = await storage.get_auto(user_id)
+        selected_now = list(auto.get("target_chat_ids") or [])
         if action == "clear_all":
-            await storage.clear_target_chats(user_id)
-            status_line = "Все группы сняты из рассылки."
+            updated = [chat_id for chat_id in selected_now if chat_id not in page_ids]
+            status_line = "Группы страницы убраны из рассылки."
         else:
-            all_ids = sorted(int(info["chat_id"]) for info in known.values())
-            if not all_ids:
-                await call.answer("Нет групп для выбора.", show_alert=True)
-                return
-            await storage.set_target_chats(user_id, all_ids)
-            status_line = "Все группы выбраны для рассылки."
+            existing_set = set(selected_now)
+            updated = list(selected_now)
+            added = False
+            for chat_id in page_ids:
+                if chat_id not in existing_set:
+                    updated.append(chat_id)
+                    existing_set.add(chat_id)
+                    added = True
+            if not added and existing_set.intersection(page_ids):
+                status_line = "Все чаты на странице уже выбраны."
+            else:
+                status_line = "Группы страницы добавлены в рассылку."
+        await storage.set_target_chats(user_id, updated)
         await storage.ensure_constraints(
             user_id=user_id,
             require_targets=call.bot.get("user_sender") is None,
@@ -926,20 +985,46 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         known = await storage.list_known_chats()
         auto = await storage.get_auto(user_id)
         reply_text = (
-            "📋 <b>Выбор групп для рассылки</b>\n\n"
+            f"{GROUPS_BASE_TEXT}\n\n"
             f"{status_line}\nПри необходимости уточните список или нажмите 'Готово'."
         )
         await safe_edit_text(
             call.message,
             reply_text,
-            reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
+            reply_markup=groups_keyboard(
+                known,
+                auto.get("target_chat_ids"),
+                origin=origin,
+                page=page,
+                per_page=GROUPS_PAGE_SIZE,
+            ),
         )
         return
-    try:
-        chat_id = int(action)
-    except ValueError:
-        await call.answer("Некорректный идентификатор чата", show_alert=True)
-        return
+    if action == "chat":
+        if not extra:
+            await call.answer("Некорректные данные.", show_alert=True)
+            return
+        try:
+            chat_id = int(extra[0])
+        except ValueError:
+            await call.answer("Некорректный идентификатор чата", show_alert=True)
+            return
+        if len(extra) > 1:
+            try:
+                page = max(0, int(extra[1]))
+            except ValueError:
+                page = 0
+    else:
+        try:
+            chat_id = int(action)
+        except ValueError:
+            await call.answer("Некорректные данные.", show_alert=True)
+            return
+        known = await storage.list_known_chats()
+        sorted_items = sorted(known.items(), key=lambda item: item[1].get("title", ""))
+        index_lookup = {int(chat_id_str): idx for idx, (chat_id_str, _) in enumerate(sorted_items)}
+        if chat_id in index_lookup:
+            page = index_lookup[chat_id] // GROUPS_PAGE_SIZE
     known = await storage.list_known_chats()
     title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
     title = quote_html(title_raw)
@@ -953,14 +1038,20 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
     known = await storage.list_known_chats()
     auto = await storage.get_auto(user_id)
     reply_text = (
-        "📋 <b>Выбор групп для рассылки</b>\n\n"
+        f"{GROUPS_BASE_TEXT}\n\n"
         f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}\n"
         "При необходимости выберите другие чаты или нажмите 'Готово'."
     )
     await safe_edit_text(
         call.message,
         reply_text,
-        reply_markup=groups_keyboard(known, auto.get("target_chat_ids"), origin=origin),
+        reply_markup=groups_keyboard(
+            known,
+            auto.get("target_chat_ids"),
+            origin=origin,
+            page=page,
+            per_page=GROUPS_PAGE_SIZE,
+        ),
     )
 
 
