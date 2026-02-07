@@ -715,6 +715,8 @@ async def _get_personal_api_credentials(bot_obj: Bot) -> tuple[Optional[int], Op
 
 @dp.message_handler(state=AccountStates.waiting_for_phone, content_types=types.ContentTypes.TEXT)
 async def handle_account_phone(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     if not personal_api_ready(message.bot):
         await message.reply("Добавление персональных номеров временно недоступно.")
         await state.finish()
@@ -760,6 +762,8 @@ async def handle_account_phone(message: types.Message, state: FSMContext) -> Non
 
 @dp.message_handler(state=AccountStates.waiting_for_code, content_types=types.ContentTypes.TEXT)
 async def handle_account_code(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     pending = await get_pending_account(message.from_user.id)
     if not pending:
         await message.reply("Нет активной сессии подтверждения. Нажмите «➕ Добавить номер» ещё раз.")
@@ -795,6 +799,8 @@ async def handle_account_code(message: types.Message, state: FSMContext) -> None
 
 @dp.message_handler(state=AccountStates.waiting_for_password, content_types=types.ContentTypes.TEXT)
 async def handle_account_password(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     pending = await get_pending_account(message.from_user.id)
     if not pending or not pending.awaiting_password:
         await message.reply("Нет активной сессии подтверждения. Начните заново.")
@@ -902,6 +908,14 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
+async def handle_possible_cancel(message: types.Message, state: FSMContext) -> bool:
+    text = (message.text or "").strip().lower()
+    if text == "/cancel":
+        await cmd_cancel(message, state)
+        return True
+    return False
+
+
 @dp.message_handler(commands=["history", "payments"], state="*")
 async def cmd_user_payments(message: types.Message, state: FSMContext) -> None:
     await state.finish()
@@ -939,6 +953,8 @@ async def cmd_admin_login(message: types.Message, state: FSMContext) -> None:
 
 @dp.message_handler(state=AdminLoginStates.waiting_for_code, content_types=types.ContentTypes.TEXT)
 async def process_admin_code(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     code = (message.text or "").strip()
     if code != ADMIN_INVITE_CODE:
         await message.reply("Неверный код. Попробуйте снова или используйте /cancel.")
@@ -1164,7 +1180,9 @@ async def cb_auto_set_message(call: types.CallbackQuery, state: FSMContext) -> N
 
 @dp.message_handler(state=AutoCampaignStates.waiting_for_message, content_types=types.ContentTypes.TEXT)
 async def process_auto_message(message: types.Message, state: FSMContext) -> None:
-    text = message.text.strip()
+    if await handle_possible_cancel(message, state):
+        return
+    text = (message.text or "").strip()
     if not text:
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
         return
@@ -1198,7 +1216,9 @@ async def cb_auto_set_interval(call: types.CallbackQuery, state: FSMContext) -> 
 
 @dp.message_handler(state=AutoCampaignStates.waiting_for_interval)
 async def process_auto_interval(message: types.Message, state: FSMContext) -> None:
-    content = message.text.strip()
+    if await handle_possible_cancel(message, state):
+        return
+    content = (message.text or "").strip()
     if not content.isdigit():
         await message.reply("Нужно целое число минут. Попробуйте ещё раз.")
         return
@@ -1226,6 +1246,8 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
 
 @dp.message_handler(state=AdminManualPaymentStates.waiting_for_user, content_types=types.ContentTypes.TEXT)
 async def process_manual_payment_user(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     if not await is_admin_user(message.from_user.id):
         await message.reply("Доступно только администраторам.")
         await state.finish()
@@ -1266,6 +1288,8 @@ async def process_manual_payment_user(message: types.Message, state: FSMContext)
 
 @dp.message_handler(state=PaymentStates.waiting_for_card_number, content_types=types.ContentTypes.TEXT)
 async def process_payment_card_number(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     digits = "".join(filter(str.isdigit, message.text or ""))
     if len(digits) < 12 or len(digits) > 19:
         await message.reply(PAYMENT_CARD_INVALID_MESSAGE)
@@ -1278,6 +1302,8 @@ async def process_payment_card_number(message: types.Message, state: FSMContext)
 
 @dp.message_handler(state=PaymentStates.waiting_for_card_name, content_types=types.ContentTypes.TEXT)
 async def process_payment_card_name(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
     card_name = (message.text or "").strip()
     if len(card_name) < 3:
         await message.reply(PAYMENT_CARD_NAME_INVALID_MESSAGE)
