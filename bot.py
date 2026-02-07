@@ -602,16 +602,17 @@ async def show_account_menu(message: types.Message, *, user_id: int) -> None:
     else:
         lines.append("Пока нет подключённых номеров. Нажмите «➕ Добавить номер», чтобы пройти подтверждение.")
     text = "\n".join(lines)
-    await safe_edit_text(
-        message,
-        text,
-        reply_markup=accounts_keyboard(
-            accounts,
-            active_account_id=active_account_id,
-            allow_bot_sender=allow_bot_sender,
-            bot_label=bot_label,
-        ),
+    keyboard = accounts_keyboard(
+        accounts,
+        active_account_id=active_account_id,
+        allow_bot_sender=allow_bot_sender,
+        bot_label=bot_label,
     )
+    sender_is_bot = bool(message.from_user and message.from_user.is_bot)
+    if sender_is_bot:
+        await safe_edit_text(message, text, reply_markup=keyboard)
+    else:
+        await message.answer(text, reply_markup=keyboard)
 
 
 def personal_api_ready(bot_obj: Bot) -> bool:
@@ -888,9 +889,15 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     if current_state is None:
         return
-    if current_state.startswith(AccountStates.__name__):
-        await replace_pending_account(message.from_user.id, None)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    is_account_state = current_state.startswith(AccountStates.__name__)
+    if is_account_state:
+        await replace_pending_account(user_id, None)
     await state.finish()
+    if is_account_state:
+        await message.answer("Действие отменено. Возвращаемся к выбору номера.")
+        await show_account_menu(message, user_id=user_id)
+        return
     await message.answer("Действие отменено. Возвращаемся в меню.")
     await send_main_menu(message)
 
