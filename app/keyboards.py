@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -36,7 +36,7 @@ def main_menu_keyboard(is_admin: bool, *, allow_group_pick: bool) -> InlineKeybo
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def auto_menu_keyboard(*, is_enabled: bool, allow_group_pick: bool) -> InlineKeyboardMarkup:
+def auto_menu_keyboard(*, is_enabled: bool, allow_group_pick: bool, allow_account_pick: bool) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton("✏️ Сообщение", callback_data="auto:set_message"),
@@ -45,6 +45,8 @@ def auto_menu_keyboard(*, is_enabled: bool, allow_group_pick: bool) -> InlineKey
     ]
     if allow_group_pick:
         keyboard.append([InlineKeyboardButton("👥 Группы", callback_data="auto:pick_groups")])
+    if allow_account_pick:
+        keyboard.append([InlineKeyboardButton("📱 Номер", callback_data="auto:pick_account")])
     toggle_label = "⏸ Остановить" if is_enabled else "▶️ Запустить"
     toggle_action = "auto:stop" if is_enabled else "auto:start"
     keyboard.append([InlineKeyboardButton(toggle_label, callback_data=toggle_action)])
@@ -105,4 +107,36 @@ def groups_keyboard(
     rows.append([
         InlineKeyboardButton("⬅️ Готово", callback_data=f"group:{origin}:done:{current_page}")
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def accounts_keyboard(
+    accounts: List[Dict[str, str]],
+    *,
+    active_account_id: Optional[int],
+    allow_bot_sender: bool,
+    bot_label: str = "Отправлять от бота",
+) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if allow_bot_sender:
+        prefix = "✅" if active_account_id is None else "➕"
+        rows.append([
+            InlineKeyboardButton(f"{prefix} {bot_label[:48]}", callback_data="accounts:set:bot"),
+        ])
+    for account in accounts:
+        account_id = int(account["id"])
+        label = account.get("title") or account.get("phone") or f"Аккаунт {account_id}"
+        prefix = "✅" if account_id == active_account_id else "➕"
+        rows.append([
+            InlineKeyboardButton(
+                f"{prefix} {label[:48]}",
+                callback_data=f"accounts:set:{account_id}",
+            )
+        ])
+    if active_account_id is not None:
+        rows.append([
+            InlineKeyboardButton("🔄 Обновить чаты", callback_data=f"accounts:refresh:{active_account_id}")
+        ])
+    rows.append([InlineKeyboardButton("➕ Добавить номер", callback_data="accounts:add")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="accounts:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

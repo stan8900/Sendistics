@@ -3,7 +3,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 try:
@@ -72,6 +72,25 @@ class Storage:
         if not self._is_postgres:
             self._conn.commit()
 
+    def _column_exists(self, table: str, column: str) -> bool:
+        if self._is_postgres:
+            query = """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s
+            """
+            cur = self._execute(query, (table, column))
+            return cur.fetchone() is not None
+        cur = self._conn.execute(f"PRAGMA table_info({table})")
+        return any(row[1] == column for row in cur.fetchall())
+
+    def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
+        if self._column_exists(table, column):
+            return
+        sql = f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        self._execute(sql)
+        self._commit()
+
     async def get_data(self) -> Dict[str, Any]:
         async with self._lock:
             return {
@@ -112,35 +131,78 @@ class Storage:
             )
             self._commit()
 
-    async def toggle_target_chat(self, user_id: int, chat_id: int, title: Optional[str] = None) -> bool:
+    async def toggle_target_chat(
+        self,
+        user_id: int,
+        chat_id: int,
+        title: Optional[str] = None,
+        *,
+        account_id: Optional[int] = None,
+    ) -> bool:
         async with self._lock:
             self._ensure_user_auto_locked(user_id)
+            if account_id is None:
+                cur = self._execute(
+                    "SELECT 1 FROM user_auto_targets WHERE user_id = ? AND chat_id = ?",
+                    (user_id, chat_id),
+                )
+                exists = cur.fetchone() is not None
+                if exists:
+                    self._execute(
+                        "DELETE FROM user_auto_targets WHERE user_id = ? AND chat_id = ?",
+                        (user_id, chat_id),
+                    )
+                    self._commit()
+                    return False
+                self._execute(
+                    """
+                    INSERT INTO user_auto_targets (user_id, chat_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(user_id, chat_id) DO NOTHING
+                    """,
+                    (user_id, chat_id),
+                )
+                if title:
+                    self._ensure_known_chat_locked(chat_id, title)
+                self._commit()
+                return True
+
             cur = self._execute(
-                "SELECT 1 FROM user_auto_targets WHERE user_id = ? AND chat_id = ?",
-                (user_id, chat_id),
+                """
+                SELECT 1 FROM user_account_targets
+                WHERE user_id = ? AND account_id = ? AND chat_id = ?
+                """,
+                (user_id, account_id, chat_id),
             )
             exists = cur.fetchone() is not None
             if exists:
                 self._execute(
-                    "DELETE FROM user_auto_targets WHERE user_id = ? AND chat_id = ?",
-                    (user_id, chat_id),
+                    """
+                    DELETE FROM user_account_targets
+                    WHERE user_id = ? AND account_id = ? AND chat_id = ?
+                    """,
+                    (user_id, account_id, chat_id),
                 )
                 self._commit()
                 return False
             self._execute(
                 """
-                INSERT INTO user_auto_targets (user_id, chat_id)
-                VALUES (?, ?)
-                ON CONFLICT(user_id, chat_id) DO NOTHING
+                INSERT INTO user_account_targets (user_id, account_id, chat_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, account_id, chat_id) DO NOTHING
                 """,
-                (user_id, chat_id),
+                (user_id, account_id, chat_id),
             )
-            if title:
-                self._ensure_known_chat_locked(chat_id, title)
             self._commit()
             return True
 
-    async def set_target_chats(self, user_id: int, chat_ids: Iterable[int]) -> None:
+    async def set_target_chats(
+        self,
+        user_id: int,
+        chat_ids: Iterable[int],
+        *,
+        account_id: Optional[int] = None,
+    ) -> None:
         async with self._lock:
             self._ensure_user_auto_locked(user_id)
             ids = []
@@ -149,20 +211,210 @@ class Storage:
                     ids.append(int(chat_id))
                 except (TypeError, ValueError):
                     continue
-            self._execute("DELETE FROM user_auto_targets WHERE user_id = ?", (user_id,))
+            if account_id is None:
+                self._execute("DELETE FROM user_auto_targets WHERE user_id = ?", (user_id,))
+                target_table = "user_auto_targets"
+                params = [(user_id, chat_id) for chat_id in ids]
+            else:
+                self._execute(
+                    "DELETE FROM user_account_targets WHERE user_id = ? AND account_id = ?",
+                    (user_id, account_id),
+                )
+                target_table = "user_account_targets"
+                params = [(user_id, account_id, chat_id) for chat_id in ids]
             if ids:
                 self._executemany(
-                    """
-                    INSERT INTO user_auto_targets (user_id, chat_id)
-                    VALUES (?, ?)
-                    ON CONFLICT(user_id, chat_id) DO NOTHING
-                    """,
-                    [(user_id, chat_id) for chat_id in ids],
+                    {
+                        "user_auto_targets": """
+                            INSERT INTO user_auto_targets (user_id, chat_id)
+                            VALUES (?, ?)
+                            ON CONFLICT(user_id, chat_id) DO NOTHING
+                        """,
+                        "user_account_targets": """
+                            INSERT INTO user_account_targets (user_id, account_id, chat_id)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(user_id, account_id, chat_id) DO NOTHING
+                        """,
+                    }[target_table],
+                    params,
                 )
             self._commit()
 
-    async def clear_target_chats(self, user_id: int) -> None:
-        await self.set_target_chats(user_id, [])
+    async def clear_target_chats(self, user_id: int, *, account_id: Optional[int] = None) -> None:
+        await self.set_target_chats(user_id, [], account_id=account_id)
+
+    async def list_user_accounts(self, owner_id: int) -> List[Dict[str, Any]]:
+        async with self._lock:
+            rows = self._execute(
+                """
+                SELECT id, owner_user_id, phone, session, title, username, last_synced_at,
+                       created_at, updated_at
+                FROM user_accounts
+                WHERE owner_user_id = ?
+                ORDER BY created_at DESC
+                """,
+                (owner_id,),
+            ).fetchall()
+            return [self._row_to_account(row) for row in rows]
+
+    async def get_user_account(
+        self,
+        account_id: int,
+        *,
+        owner_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            row = self._execute(
+                """
+                SELECT id, owner_user_id, phone, session, title, username, last_synced_at,
+                       created_at, updated_at
+                FROM user_accounts
+                WHERE id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            if not row:
+                return None
+            account = self._row_to_account(row)
+            if owner_id is not None and account["owner_user_id"] != owner_id:
+                return None
+            return account
+
+    async def create_user_account(
+        self,
+        owner_id: int,
+        *,
+        phone: str,
+        session: str,
+        title: Optional[str],
+        username: Optional[str],
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            now = datetime.utcnow().isoformat()
+            if self._is_postgres:
+                cur = self._execute(
+                    """
+                    INSERT INTO user_accounts (
+                        owner_user_id, phone, session, title, username,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (owner_id, phone, session, title, username, now, now),
+                )
+                new_id = cur.fetchone()["id"]
+            else:
+                cur = self._execute(
+                    """
+                    INSERT INTO user_accounts (
+                        owner_user_id, phone, session, title, username,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (owner_id, phone, session, title, username, now, now),
+                )
+                new_id = cur.lastrowid
+            self._commit()
+            return await self.get_user_account(int(new_id))
+
+    async def delete_user_account(self, owner_id: int, account_id: int) -> bool:
+        async with self._lock:
+            row = self._execute(
+                "SELECT owner_user_id FROM user_accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if not row or int(row["owner_user_id"]) != int(owner_id):
+                return False
+            self._execute("DELETE FROM user_accounts WHERE id = ?", (account_id,))
+            # Targets and chats are removed by cascading foreign keys
+            self._execute(
+                """
+                UPDATE user_auto_configs
+                SET sender_account_id = NULL
+                WHERE sender_account_id = ?
+                """,
+                (account_id,),
+            )
+            self._commit()
+            return True
+
+    async def update_user_account_session(
+        self,
+        owner_id: int,
+        account_id: int,
+        session: str,
+    ) -> bool:
+        async with self._lock:
+            row = self._execute(
+                "SELECT owner_user_id FROM user_accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if not row or int(row["owner_user_id"]) != int(owner_id):
+                return False
+            now = datetime.utcnow().isoformat()
+            self._execute(
+                "UPDATE user_accounts SET session = ?, updated_at = ? WHERE id = ?",
+                (session, now, account_id),
+            )
+            self._commit()
+            return True
+
+    async def set_user_sender_account(self, user_id: int, account_id: Optional[int]) -> None:
+        async with self._lock:
+            self._ensure_user_auto_locked(user_id)
+            if account_id is not None:
+                owner_row = self._execute(
+                    """
+                    SELECT owner_user_id FROM user_accounts
+                    WHERE id = ?
+                    """,
+                    (account_id,),
+                ).fetchone()
+                if not owner_row or int(owner_row["owner_user_id"]) != int(user_id):
+                    raise ValueError("Аккаунт не найден или недоступен.")
+            self._execute(
+                "UPDATE user_auto_configs SET sender_account_id = ? WHERE user_id = ?",
+                (account_id, user_id),
+            )
+            self._commit()
+
+    async def replace_account_chats(
+        self,
+        account_id: int,
+        chats: Iterable[Tuple[int, str]],
+    ) -> None:
+        async with self._lock:
+            self._execute("DELETE FROM user_account_chats WHERE account_id = ?", (account_id,))
+            to_insert = []
+            for chat_id, title in chats:
+                try:
+                    chat_id_int = int(chat_id)
+                except (TypeError, ValueError):
+                    continue
+                to_insert.append((account_id, chat_id_int, (title or f"Чат {chat_id_int}").strip()))
+            if to_insert:
+                self._executemany(
+                    """
+                    INSERT INTO user_account_chats (account_id, chat_id, title)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(account_id, chat_id) DO UPDATE SET title = excluded.title
+                    """,
+                    to_insert,
+                )
+            now = datetime.utcnow().isoformat()
+            self._execute(
+                "UPDATE user_accounts SET last_synced_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, account_id),
+            )
+            self._commit()
+
+    async def list_account_chats(
+        self,
+        owner_id: int,
+        account_id: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        async with self._lock:
+            return self._list_user_account_chats_locked(account_id, owner_id=owner_id)
 
     async def update_stats(self, user_id: int, *, sent: int, errors: List[str]) -> None:
         async with self._lock:
@@ -190,8 +442,15 @@ class Storage:
             )
             self._commit()
 
-    async def list_known_chats(self) -> Dict[str, Dict[str, Any]]:
+    async def list_known_chats(
+        self,
+        *,
+        account_id: Optional[int] = None,
+        owner_id: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         async with self._lock:
+            if account_id is not None:
+                return self._list_user_account_chats_locked(account_id, owner_id=owner_id)
             return self._list_known_chats_locked()
 
     async def upsert_known_chat(self, chat_id: int, title: str, *, ensure_target: bool = False) -> None:
@@ -426,9 +685,17 @@ class Storage:
             for uid in targets:
                 self._ensure_user_auto_locked(uid)
                 auto = self._get_auto_locked(uid)
+                account_id = auto.get("sender_account_id")
+                if account_id is not None and not self._account_exists_locked(account_id):
+                    self._execute(
+                        "UPDATE user_auto_configs SET sender_account_id = NULL WHERE user_id = ?",
+                        (uid,),
+                    )
+                    account_id = None
                 has_message = bool(auto["message"])
                 has_interval = (auto["interval_minutes"] or 0) > 0
-                has_targets = bool(auto["target_chat_ids"]) or not require_targets
+                needs_targets = require_targets and account_id is None
+                has_targets = bool(auto["target_chat_ids"]) or not needs_targets
                 if auto["is_enabled"] and not (has_message and has_interval and has_targets):
                     self._execute(
                         "UPDATE user_auto_configs SET is_enabled = 0 WHERE user_id = ?",
@@ -440,12 +707,13 @@ class Storage:
         self._ensure_user_auto_locked(user_id)
         config = self._execute(
             """
-            SELECT message, interval_minutes, is_enabled
+            SELECT message, interval_minutes, is_enabled, sender_account_id
             FROM user_auto_configs
             WHERE user_id = ?
             """,
             (user_id,),
         ).fetchone()
+        sender_account_id = config["sender_account_id"] if config else None
         stats = self._execute(
             """
             SELECT sent_total, last_sent_at, last_error
@@ -454,9 +722,8 @@ class Storage:
             """,
             (user_id,),
         ).fetchone()
-        targets = [
-            row["chat_id"]
-            for row in self._execute(
+        if sender_account_id is None:
+            cursor = self._execute(
                 """
                 SELECT chat_id FROM user_auto_targets
                 WHERE user_id = ?
@@ -464,13 +731,23 @@ class Storage:
                 """,
                 (user_id,),
             )
-        ]
+        else:
+            cursor = self._execute(
+                """
+                SELECT chat_id FROM user_account_targets
+                WHERE user_id = ? AND account_id = ?
+                ORDER BY chat_id
+                """,
+                (user_id, sender_account_id),
+            )
+        targets = [row["chat_id"] for row in cursor]
         return {
             "user_id": user_id,
             "message": config["message"] if config else None,
             "interval_minutes": config["interval_minutes"] if config else 0,
             "target_chat_ids": targets,
             "is_enabled": bool(config["is_enabled"]) if config else False,
+            "sender_account_id": sender_account_id,
             "stats": {
                 "sent_total": stats["sent_total"] if stats else 0,
                 "last_sent_at": stats["last_sent_at"] if stats else None,
@@ -531,9 +808,44 @@ class Storage:
         if changed:
             self._commit()
 
+    def _account_exists_locked(self, account_id: int) -> bool:
+        row = self._execute(
+            "SELECT 1 FROM user_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        return row is not None
+
     def _list_known_chats_locked(self) -> Dict[str, Dict[str, Any]]:
         rows = self._execute(
             "SELECT chat_id, title FROM known_chats ORDER BY LOWER(title)"
+        ).fetchall()
+        return {
+            str(row["chat_id"]): {"chat_id": row["chat_id"], "title": row["title"]}
+            for row in rows
+        }
+
+    def _list_user_account_chats_locked(
+        self,
+        account_id: int,
+        *,
+        owner_id: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        account = self._execute(
+            "SELECT id, owner_user_id FROM user_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        if not account:
+            return {}
+        if owner_id is not None and int(account["owner_user_id"]) != int(owner_id):
+            return {}
+        rows = self._execute(
+            """
+            SELECT chat_id, title
+            FROM user_account_chats
+            WHERE account_id = ?
+            ORDER BY LOWER(title)
+            """,
+            (account_id,),
         ).fetchall()
         return {
             str(row["chat_id"]): {"chat_id": row["chat_id"], "title": row["title"]}
@@ -601,6 +913,61 @@ class Storage:
             )
             """
         )
+        if self._is_postgres:
+            self._execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_accounts (
+                    id BIGSERIAL PRIMARY KEY,
+                    owner_user_id BIGINT NOT NULL,
+                    phone TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    title TEXT,
+                    username TEXT,
+                    last_synced_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        else:
+            self._execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id BIGINT NOT NULL,
+                    phone TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    title TEXT,
+                    username TEXT,
+                    last_synced_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_account_chats (
+                account_id INTEGER NOT NULL,
+                chat_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                PRIMARY KEY(account_id, chat_id),
+                FOREIGN KEY(account_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_accounts_owner
+            ON user_accounts(owner_user_id)
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_account_chats_account
+            ON user_account_chats(account_id)
+            """
+        )
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS user_auto_configs (
@@ -610,6 +977,11 @@ class Storage:
                 is_enabled INTEGER NOT NULL DEFAULT 0
             )
             """
+        )
+        self._add_column_if_missing(
+            "user_auto_configs",
+            "sender_account_id",
+            "INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL",
         )
         self._execute(
             """
@@ -629,6 +1001,23 @@ class Storage:
                 PRIMARY KEY(user_id, chat_id),
                 FOREIGN KEY(chat_id) REFERENCES known_chats(chat_id) ON DELETE CASCADE
             )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_account_targets (
+                user_id BIGINT NOT NULL,
+                account_id INTEGER NOT NULL,
+                chat_id BIGINT NOT NULL,
+                PRIMARY KEY(user_id, account_id, chat_id),
+                FOREIGN KEY(account_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_account_targets_account
+            ON user_account_targets(account_id)
             """
         )
         self._execute(
@@ -803,4 +1192,9 @@ class Storage:
             "admin_id": data.pop("resolved_by_admin_id"),
             "admin_username": data.pop("resolved_by_admin_username"),
         }
+        return data
+
+    def _row_to_account(self, row: Any) -> Dict[str, Any]:
+        data = dict(row)
+        data["owner_user_id"] = int(data["owner_user_id"])
         return data

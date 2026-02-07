@@ -2,9 +2,10 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -14,12 +15,23 @@ from aiogram.utils.markdown import hbold, quote_html
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from dotenv import load_dotenv
 
+from app.account_manager import AccountManager
 from app.auto_sender import AutoSender
-from app.keyboards import GROUPS_PAGE_SIZE, auto_menu_keyboard, groups_keyboard, main_menu_keyboard
+from app.keyboards import GROUPS_PAGE_SIZE, accounts_keyboard, auto_menu_keyboard, groups_keyboard, main_menu_keyboard
 from app.pdf_reports import build_payments_pdf
-from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates
+from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates, AccountStates
 from app.storage import Storage
 from app.user_sender import UserSender
+from telethon import TelegramClient
+from telethon.errors import (
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+    PasswordHashInvalidError,
+)
+from telethon.sessions import StringSession
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -73,15 +85,18 @@ storage = create_storage()
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
 tg_user_session = os.getenv("TG_USER_SESSION")
-user_sender: Optional[UserSender]
-if tg_user_api_id_raw and tg_user_api_hash and tg_user_session:
+tg_user_api_id: Optional[int]
+if tg_user_api_id_raw:
     try:
         tg_user_api_id = int(tg_user_api_id_raw)
     except ValueError:
         logger.warning("TG_USER_API_ID должен быть числом. Пользовательская рассылка отключена.")
-        user_sender = None
-    else:
-        user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
+        tg_user_api_id = None
+else:
+    tg_user_api_id = None
+user_sender: Optional[UserSender]
+if tg_user_api_id and tg_user_api_hash and tg_user_session:
+    user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
 else:
     user_sender = None
 
@@ -91,6 +106,13 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
 bot["user_sender"] = user_sender
+bot["personal_api_id"] = tg_user_api_id
+bot["personal_api_hash"] = tg_user_api_hash
+bot["personal_api_available"] = bool(tg_user_api_id and tg_user_api_hash)
+if bot["personal_api_available"] and tg_user_api_id and tg_user_api_hash:
+    bot["account_manager"] = AccountManager(tg_user_api_id, tg_user_api_hash)
+else:
+    bot["account_manager"] = None
 
 PAYMENT_AMOUNT = 100_000
 PAYMENT_CURRENCY = "UZS"
@@ -140,6 +162,62 @@ STATIC_ADMIN_IDS: Set[int] = {
 ADMIN_INVITE_CODE = os.getenv("ADMIN_CODE", "TW13")
 
 
+@dataclass
+class PendingAccountLogin:
+    client: TelegramClient
+    phone: str
+    phone_code_hash: str
+    awaiting_password: bool = False
+
+
+pending_account_lock = asyncio.Lock()
+pending_account_logins: Dict[int, PendingAccountLogin] = {}
+
+
+async def refresh_account_chats(bot_obj: Bot, owner_id: int, account_id: int) -> bool:
+    manager: Optional[AccountManager] = bot_obj.get("account_manager")
+    if not manager:
+        return False
+    account = await storage.get_user_account(account_id, owner_id=owner_id)
+    if not account:
+        return False
+    session = account.get("session")
+    if not session:
+        return False
+    try:
+        sender = await manager.get_sender(account_id, session)
+        dialogs = await sender.list_accessible_chats()
+    except Exception:
+        logger.exception("Не удалось обновить список чатов аккаунта %s", account_id)
+        return False
+    await storage.replace_account_chats(account_id, dialogs)
+    return True
+
+
+async def should_require_targets(bot_obj: Bot, user_id: int) -> bool:
+    if bot_obj.get("user_sender"):
+        return False
+    auto = await storage.get_auto(user_id)
+    return not auto.get("sender_account_id")
+
+
+async def replace_pending_account(user_id: int, pending: Optional[PendingAccountLogin]) -> None:
+    async with pending_account_lock:
+        existing = pending_account_logins.pop(user_id, None)
+        if pending:
+            pending_account_logins[user_id] = pending
+    if existing:
+        try:
+            await existing.client.disconnect()
+        except Exception:
+            logger.exception("Не удалось закрыть предыдущую сессию подтверждения номера пользователя %s.", user_id)
+
+
+async def get_pending_account(user_id: int) -> Optional[PendingAccountLogin]:
+    async with pending_account_lock:
+        return pending_account_logins.get(user_id)
+
+
 async def get_user_role(user_id: int) -> str:
     if user_id in STATIC_ADMIN_IDS:
         return "admin"
@@ -173,6 +251,39 @@ def format_datetime(value: Optional[str]) -> str:
         return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
     except ValueError:
         return value
+
+
+def mask_phone(phone: Optional[str]) -> str:
+    if not phone:
+        return "—"
+    raw = "".join(ch for ch in phone.strip() if ch.isdigit() or ch == "+")
+    if len(raw) <= 6:
+        return raw
+    prefix = raw[:4]
+    suffix = raw[-2:]
+    return f"{prefix}…{suffix}"
+
+
+def format_account_display(account: Dict[str, Any]) -> str:
+    title = (account.get("title") or "").strip()
+    phone = mask_phone(account.get("phone"))
+    if title:
+        if phone and phone != "—":
+            return f"{title} ({phone})"
+        return title
+    return phone or "Аккаунт"
+
+
+def normalize_phone(raw: str) -> Optional[str]:
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    text = raw.strip()
+    if text.startswith("+"):
+        return f"+{digits}"
+    if digits.startswith("00"):
+        return f"+{digits[2:]}"
+    return f"+{digits}"
 
 
 def payment_admin_keyboard(request_id: str) -> InlineKeyboardMarkup:
@@ -379,12 +490,36 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: in
         message_preview = message_preview[:177] + "..."
     interval = auto_data.get("interval_minutes") or 0
     targets = auto_data.get("target_chat_ids") or []
-    if message.bot.get("user_sender"):
+    accounts = await storage.list_user_accounts(user_id)
+    selected_account_id = auto_data.get("sender_account_id")
+    selected_account = None
+    if selected_account_id is not None:
+        for account in accounts:
+            if int(account["id"]) == int(selected_account_id):
+                selected_account = account
+                break
+    personal_api_available = bool(message.bot.get("personal_api_available"))
+    allow_group_pick = True
+    if selected_account:
+        sender_line = f"Номер для рассылки: {format_account_display(selected_account)}"
+        known = await storage.list_known_chats(account_id=selected_account_id, owner_id=user_id)
+        total_known = len(known)
+        if targets:
+            total = total_known or len(targets)
+            group_line = f"Группы номера: {len(targets)} выбрано из {total}"
+        else:
+            group_line = (
+                f"Группы номера: все {total_known} чатов"
+                if total_known
+                else "Группы номера: нет сохранённых чатов"
+            )
+    elif message.bot.get("user_sender"):
         auto_sender: Optional[AutoSender] = message.bot.get("auto_sender")
         available = 0
         if auto_sender:
             personal_chats = await auto_sender.get_personal_chats(refresh=True)
             available = len(personal_chats)
+        sender_line = "Номер для рассылки: общий личный аккаунт"
         if targets:
             total = available or len(targets)
             group_line = f"Группы пользователя: {len(targets)} выбрано из {total}"
@@ -395,6 +530,11 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: in
                 else "Группы пользователя: нет доступных чатов"
             )
     else:
+        sender_line = (
+            "Номер для рассылки: бот"
+            if not personal_api_available
+            else "Номер для рассылки: бот (можно выбрать личный номер)"
+        )
         group_line = f"Выбрано групп: {len(targets)}"
     system_payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
     latest_payment = await storage.latest_payment_timestamp()
@@ -425,6 +565,7 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: in
         f"🛠 {hbold('Авторассылка')}\n\n"
         f"Статус: {status}\n"
         f"Интервал: {interval} мин\n"
+        f"{sender_line}\n"
         f"{group_line}\n\n"
         f"{payment_line}\n\n"
         f"Сообщение:\n{message_preview}"
@@ -434,11 +575,306 @@ async def show_auto_menu(message: types.Message, auto_data: dict, *, user_id: in
             text,
             reply_markup=auto_menu_keyboard(
                 is_enabled=auto_data.get("is_enabled"),
-                allow_group_pick=True,
+                allow_group_pick=allow_group_pick,
+                allow_account_pick=personal_api_available,
             ),
         )
     except exceptions.MessageNotModified:
         pass
+
+
+async def show_account_menu(message: types.Message, *, user_id: int) -> None:
+    accounts = await storage.list_user_accounts(user_id)
+    auto_data = await storage.get_auto(user_id)
+    active_account_id = auto_data.get("sender_account_id")
+    allow_bot_sender = True
+    bot_label = "Отправлять от бота"
+    if message.bot.get("user_sender"):
+        bot_label = "Отправлять от общего аккаунта"
+    lines = [
+        "📱 <b>Номера для рассылки</b>",
+        "Выберите аккаунт, с которого будет идти авторассылка.",
+    ]
+    if accounts:
+        for account in accounts:
+            marker = "✅" if active_account_id is not None and int(account["id"]) == int(active_account_id) else "•"
+            lines.append(f"{marker} {format_account_display(account)}")
+    else:
+        lines.append("Пока нет подключённых номеров. Нажмите «➕ Добавить номер», чтобы пройти подтверждение.")
+    text = "\n".join(lines)
+    await safe_edit_text(
+        message,
+        text,
+        reply_markup=accounts_keyboard(
+            accounts,
+            active_account_id=active_account_id,
+            allow_bot_sender=allow_bot_sender,
+            bot_label=bot_label,
+        ),
+    )
+
+
+def personal_api_ready(bot_obj: Bot) -> bool:
+    return bool(bot_obj.get("personal_api_available"))
+
+
+@dp.callback_query_handler(lambda c: c.data == "auto:pick_account")
+async def cb_auto_pick_account(call: types.CallbackQuery) -> None:
+    if not personal_api_ready(call.bot):
+        await call.answer("Добавление личных номеров отключено. Укажите TG_USER_API_ID и TG_USER_API_HASH.", show_alert=True)
+        return
+    await call.answer()
+    await show_account_menu(call.message, user_id=call.from_user.id)
+
+
+@dp.callback_query_handler(lambda c: c.data == "accounts:back")
+async def cb_accounts_back(call: types.CallbackQuery) -> None:
+    await call.answer()
+    auto_data = await storage.get_auto(call.from_user.id)
+    await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
+
+
+@dp.callback_query_handler(lambda c: c.data == "accounts:add", state="*")
+async def cb_accounts_add(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not personal_api_ready(call.bot):
+        await call.answer("Добавление личных номеров недоступно.", show_alert=True)
+        return
+    await call.answer()
+    await replace_pending_account(call.from_user.id, None)
+    await AccountStates.waiting_for_phone.set()
+    await call.message.answer(
+        "Отправьте номер телефона, который подключён к Telegram (в международном формате, например +998901234567).\n"
+        "Мы пришлём на него код подтверждения. Используйте /cancel для отмены."
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("accounts:set:"))
+async def cb_accounts_set(call: types.CallbackQuery) -> None:
+    if not personal_api_ready(call.bot):
+        await call.answer("Невозможно выбрать номер — личные аккаунты отключены.", show_alert=True)
+        return
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        await call.answer("Некорректная команда.", show_alert=True)
+        return
+    target = parts[2]
+    user_id = call.from_user.id
+    if target == "bot":
+        await storage.set_user_sender_account(user_id, None)
+        await call.answer("Рассылка будет идти от бота.", show_alert=True)
+    else:
+        try:
+            account_id = int(target)
+        except ValueError:
+            await call.answer("Некорректный идентификатор аккаунта.", show_alert=True)
+            return
+        account = await storage.get_user_account(account_id, owner_id=user_id)
+        if not account:
+            await call.answer("Аккаунт не найден или недоступен.", show_alert=True)
+            return
+        await storage.set_user_sender_account(user_id, account_id)
+        await call.answer("Номер выбран для рассылки.", show_alert=True)
+    require_targets = await should_require_targets(call.bot, user_id)
+    await storage.ensure_constraints(user_id=user_id, require_targets=require_targets)
+    auto_sender: AutoSender = call.bot["auto_sender"]
+    await auto_sender.refresh_user(user_id)
+    await show_account_menu(call.message, user_id=user_id)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("accounts:refresh:"))
+async def cb_accounts_refresh(call: types.CallbackQuery) -> None:
+    if not personal_api_ready(call.bot):
+        await call.answer("Личные номера отключены.", show_alert=True)
+        return
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        await call.answer("Некорректная команда.", show_alert=True)
+        return
+    try:
+        account_id = int(parts[2])
+    except ValueError:
+        await call.answer("Некорректный идентификатор.", show_alert=True)
+        return
+    account = await storage.get_user_account(account_id, owner_id=call.from_user.id)
+    if not account:
+        await call.answer("Аккаунт не найден.", show_alert=True)
+        return
+    await call.answer("Обновляем чаты…")
+    success = await refresh_account_chats(call.bot, call.from_user.id, account_id)
+    if success:
+        await call.message.answer("Список чатов обновлён. Теперь можно выбрать группы.")
+    else:
+        await call.message.answer("Не удалось обновить чаты. Проверьте, что аккаунт авторизован и состоит в нужных группах.")
+    await show_account_menu(call.message, user_id=call.from_user.id)
+
+
+async def _get_personal_api_credentials(bot_obj: Bot) -> tuple[Optional[int], Optional[str]]:
+    return bot_obj.get("personal_api_id"), bot_obj.get("personal_api_hash")
+
+
+@dp.message_handler(state=AccountStates.waiting_for_phone, content_types=types.ContentTypes.TEXT)
+async def handle_account_phone(message: types.Message, state: FSMContext) -> None:
+    if not personal_api_ready(message.bot):
+        await message.reply("Добавление персональных номеров временно недоступно.")
+        await state.finish()
+        return
+    normalized = normalize_phone(message.text or "")
+    if not normalized or len("".join(ch for ch in normalized if ch.isdigit())) < 8:
+        await message.reply("Отправьте номер телефона в формате +998901234567.")
+        return
+    api_id, api_hash = await _get_personal_api_credentials(message.bot)
+    if not api_id or not api_hash:
+        await message.reply("Сервер не настроен для подключения номеров. Обратитесь к администратору.")
+        await state.finish()
+        return
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    try:
+        await client.connect()
+        sent = await client.send_code_request(normalized)
+    except PhoneNumberInvalidError:
+        await message.reply("Telegram отклоняет этот номер. Убедитесь, что аккаунт активен и попробуйте снова.")
+        await client.disconnect()
+        return
+    except FloodWaitError as exc:
+        await message.reply(f"Telegram попросил подождать {exc.seconds} секунд перед следующей попыткой.")
+        await client.disconnect()
+        return
+    except Exception:
+        logger.exception("Не удалось отправить код подтверждения на %s", normalized)
+        await message.reply("Не удалось отправить код. Попробуйте ещё раз чуть позже.")
+        await client.disconnect()
+        return
+    pending = PendingAccountLogin(
+        client=client,
+        phone=normalized,
+        phone_code_hash=sent.phone_code_hash,
+    )
+    await replace_pending_account(message.from_user.id, pending)
+    await AccountStates.waiting_for_code.set()
+    await message.answer(
+        "Код выслан в Telegram. Пришлите его одним сообщением.\n"
+        "Если передумали, используйте /cancel."
+    )
+
+
+@dp.message_handler(state=AccountStates.waiting_for_code, content_types=types.ContentTypes.TEXT)
+async def handle_account_code(message: types.Message, state: FSMContext) -> None:
+    pending = await get_pending_account(message.from_user.id)
+    if not pending:
+        await message.reply("Нет активной сессии подтверждения. Нажмите «➕ Добавить номер» ещё раз.")
+        await state.finish()
+        return
+    code = "".join(ch for ch in (message.text or "") if ch.isdigit())
+    if not code:
+        await message.reply("Введите код цифрами.")
+        return
+    try:
+        await pending.client.sign_in(phone=pending.phone, code=code, phone_code_hash=pending.phone_code_hash)
+    except SessionPasswordNeededError:
+        pending.awaiting_password = True
+        await message.answer("На аккаунте включён пароль. Введите его (буквы учитываются).")
+        await AccountStates.waiting_for_password.set()
+        return
+    except PhoneCodeInvalidError:
+        await message.reply("Код неверный. Попробуйте ещё раз.")
+        return
+    except PhoneCodeExpiredError:
+        await message.reply("Срок действия кода истёк. Начните заново с «➕ Добавить номер».")
+        await replace_pending_account(message.from_user.id, None)
+        await state.finish()
+        return
+    except Exception:
+        logger.exception("Ошибка подтверждения номера для пользователя %s", message.from_user.id)
+        await message.reply("Не удалось подтвердить код. Попробуйте позже.")
+        await replace_pending_account(message.from_user.id, None)
+        await state.finish()
+        return
+    await finalize_account_login(message, state, pending)
+
+
+@dp.message_handler(state=AccountStates.waiting_for_password, content_types=types.ContentTypes.TEXT)
+async def handle_account_password(message: types.Message, state: FSMContext) -> None:
+    pending = await get_pending_account(message.from_user.id)
+    if not pending or not pending.awaiting_password:
+        await message.reply("Нет активной сессии подтверждения. Начните заново.")
+        await state.finish()
+        return
+    password = (message.text or "").strip()
+    if not password:
+        await message.reply("Пароль не может быть пустым.")
+        return
+    try:
+        await pending.client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        await message.reply("Пароль неверный. Попробуйте снова.")
+        return
+    except Exception:
+        logger.exception("Ошибка подтверждения пароля аккаунта пользователя %s", message.from_user.id)
+        await message.reply("Не удалось подтвердить пароль. Попробуйте снова.")
+        return
+    await finalize_account_login(message, state, pending)
+
+
+async def finalize_account_login(message: types.Message, state: FSMContext, pending: PendingAccountLogin) -> None:
+    user_id = message.from_user.id
+    try:
+        me = await pending.client.get_me()
+    except Exception:
+        me = None
+    username = getattr(me, "username", None) if me else None
+    full_name = " ".join(filter(None, [getattr(me, "first_name", None), getattr(me, "last_name", None)])) if me else None
+    title = full_name or username or f"Аккаунт {mask_phone(pending.phone)}"
+    session_string = pending.client.session.save()
+    try:
+        account = await storage.create_user_account(
+            user_id,
+            phone=pending.phone,
+            session=session_string,
+            title=title,
+            username=username,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить личный аккаунт пользователя %s", user_id)
+        await message.reply("Не удалось сохранить аккаунт. Попробуйте ещё раз позже.")
+        await replace_pending_account(user_id, None)
+        await state.finish()
+        return
+    account_id = int(account["id"])
+    await storage.set_user_sender_account(user_id, account_id)
+    await storage.clear_target_chats(user_id, account_id=account_id)
+    require_targets = await should_require_targets(message.bot, user_id)
+    await storage.ensure_constraints(user_id=user_id, require_targets=require_targets)
+    await refresh_account_chats(message.bot, user_id, account_id)
+    auto_sender: AutoSender = message.bot["auto_sender"]
+    await auto_sender.refresh_user(user_id)
+    await replace_pending_account(user_id, None)
+    await state.finish()
+    await message.answer(
+        f"Номер {format_account_display(account)} подключён.\n"
+        "Используйте кнопку «📱 Номер» в меню авторассылки, чтобы выбрать группы и начать отправку."
+    )
+
+
+async def load_available_chats(
+    user_id: int,
+    bot_obj: Bot,
+    *,
+    auto_data: Optional[Dict[str, Any]] = None,
+) -> tuple[Dict[str, Dict[str, Any]], Optional[int]]:
+    auto = auto_data or await storage.get_auto(user_id)
+    account_id = auto.get("sender_account_id")
+    if account_id is not None:
+        known = await storage.list_known_chats(account_id=account_id, owner_id=user_id)
+        if not known:
+            await refresh_account_chats(bot_obj, user_id, account_id)
+            known = await storage.list_known_chats(account_id=account_id, owner_id=user_id)
+        return known, account_id
+    if bot_obj.get("user_sender"):
+        auto_sender: Optional[AutoSender] = bot_obj.get("auto_sender")
+        if auto_sender:
+            await auto_sender.get_personal_chats(refresh=True)
+    known = await storage.list_known_chats()
+    return known, None
 
 
 @dp.message_handler(commands=["start", "menu"], state="*")
@@ -449,8 +885,11 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
 
 @dp.message_handler(commands=["cancel"], state="*")
 async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
-    if await state.get_state() is None:
+    current_state = await state.get_state()
+    if current_state is None:
         return
+    if current_state.startswith(AccountStates.__name__):
+        await replace_pending_account(message.from_user.id, None)
     await state.finish()
     await message.answer("Действие отменено. Возвращаемся в меню.")
     await send_main_menu(message)
@@ -560,16 +999,12 @@ async def cb_main_groups(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
-    if call.bot.get("user_sender"):
-        auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-        if auto_sender:
-            await auto_sender.get_personal_chats(refresh=True)
-    known = await storage.list_known_chats()
     auto = await storage.get_auto(call.from_user.id)
+    known, account_id = await load_available_chats(call.from_user.id, call.bot, auto_data=auto)
     selected = auto.get("target_chat_ids") or []
     if not known:
         text, keyboard, _ = await build_main_menu(call.from_user.id)
-        if call.bot.get("user_sender"):
+        if account_id is not None or personal_api_ready(call.bot):
             empty_text = (
                 "📋 Пока нет групп для рассылки.\n"
                 "Добавьте личный аккаунт в рабочие чаты и повторите попытку."
@@ -727,7 +1162,8 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
         await message.reply("Сообщение не может быть пустым. Попробуйте снова.")
         return
     await storage.set_auto_message(message.from_user.id, text)
-    await storage.ensure_constraints(user_id=message.from_user.id, require_targets=message.bot.get("user_sender") is None)
+    require_targets = await should_require_targets(message.bot, message.from_user.id)
+    await storage.ensure_constraints(user_id=message.from_user.id, require_targets=require_targets)
     auto_sender: AutoSender = message.bot["auto_sender"]
     await auto_sender.refresh_user(message.from_user.id)
     await state.finish()
@@ -738,6 +1174,7 @@ async def process_auto_message(message: types.Message, state: FSMContext) -> Non
         reply_markup=auto_menu_keyboard(
             is_enabled=auto_data.get("is_enabled"),
             allow_group_pick=True,
+            allow_account_pick=bool(message.bot.get("personal_api_available")),
         ),
     )
 
@@ -763,7 +1200,8 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
         await message.reply("Интервал должен быть больше нуля.")
         return
     await storage.set_auto_interval(message.from_user.id, minutes)
-    await storage.ensure_constraints(user_id=message.from_user.id, require_targets=message.bot.get("user_sender") is None)
+    require_targets = await should_require_targets(message.bot, message.from_user.id)
+    await storage.ensure_constraints(user_id=message.from_user.id, require_targets=require_targets)
     auto_sender: AutoSender = message.bot["auto_sender"]
     await auto_sender.refresh_user(message.from_user.id)
     await state.finish()
@@ -774,6 +1212,7 @@ async def process_auto_interval(message: types.Message, state: FSMContext) -> No
         reply_markup=auto_menu_keyboard(
             is_enabled=auto_data.get("is_enabled"),
             allow_group_pick=True,
+            allow_account_pick=bool(message.bot.get("personal_api_available")),
         ),
     )
 
@@ -858,16 +1297,12 @@ async def process_payment_card_name(message: types.Message, state: FSMContext) -
 @dp.callback_query_handler(lambda c: c.data == "auto:pick_groups")
 async def cb_auto_pick_groups(call: types.CallbackQuery) -> None:
     await call.answer()
-    if call.bot.get("user_sender"):
-        auto_sender: Optional[AutoSender] = call.bot.get("auto_sender")
-        if auto_sender:
-            await auto_sender.get_personal_chats(refresh=True)
-    known = await storage.list_known_chats()
     auto = await storage.get_auto(call.from_user.id)
+    known, account_id = await load_available_chats(call.from_user.id, call.bot, auto_data=auto)
     selected = auto.get("target_chat_ids") or []
     if not known:
         _, keyboard, _ = await build_main_menu(call.from_user.id)
-        if call.bot.get("user_sender"):
+        if account_id is not None or personal_api_ready(call.bot):
             empty_text = (
                 "📋 Пока нет групп для рассылки.\nДобавьте личный аккаунт в рабочие чаты и повторите попытку."
             )
@@ -913,17 +1348,25 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
             auto_data = await storage.get_auto(user_id)
             await show_auto_menu(call.message, auto_data, user_id=user_id)
         return
+    auto = await storage.get_auto(user_id)
+
+    async def fetch_known(auto_snapshot: Optional[Dict[str, Any]] = None) -> tuple[
+        Dict[str, Dict[str, Any]], Dict[str, Any], Optional[int]
+    ]:
+        snapshot = auto_snapshot or await storage.get_auto(user_id)
+        known_chats, account = await load_available_chats(user_id, call.bot, auto_data=snapshot)
+        return known_chats, snapshot, account
+
     if action == "page":
         if extra:
             try:
                 page = max(0, int(extra[0]))
             except ValueError:
                 page = 0
-        known = await storage.list_known_chats()
+        known, auto, account_id = await fetch_known(auto)
         if not known:
             await call.answer("Нет доступных групп.", show_alert=True)
             return
-        auto = await storage.get_auto(user_id)
         await safe_edit_text(
             call.message,
             GROUPS_BASE_TEXT,
@@ -942,28 +1385,28 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
                 page = max(0, int(extra[0]))
             except ValueError:
                 page = 0
-        known = await storage.list_known_chats()
+        known, auto, account_id = await fetch_known(auto)
         if not known:
             await call.answer("Нет доступных групп.", show_alert=True)
             return
         if action == "clear_all":
-            await storage.clear_target_chats(user_id)
+            await storage.clear_target_chats(user_id, account_id=account_id)
             status_line = "Все группы сняты из рассылки."
         else:
             all_ids = sorted(int(info["chat_id"]) for info in known.values())
             if not all_ids:
                 await call.answer("Нет групп для выбора.", show_alert=True)
                 return
-            await storage.set_target_chats(user_id, all_ids)
+            await storage.set_target_chats(user_id, all_ids, account_id=account_id)
             status_line = "Все группы выбраны для рассылки."
+        require_targets = await should_require_targets(call.bot, user_id)
         await storage.ensure_constraints(
             user_id=user_id,
-            require_targets=call.bot.get("user_sender") is None,
+            require_targets=require_targets,
         )
         auto_sender: AutoSender = call.bot["auto_sender"]
         await auto_sender.refresh_user(user_id)
-        known = await storage.list_known_chats()
-        auto = await storage.get_auto(user_id)
+        known, auto, account_id = await fetch_known(None)
         reply_text = (
             f"{GROUPS_BASE_TEXT}\n\n"
             f"{status_line}\nПри необходимости уточните список или нажмите 'Готово'."
@@ -1000,23 +1443,23 @@ async def cb_group_toggle(call: types.CallbackQuery) -> None:
         except ValueError:
             await call.answer("Некорректные данные.", show_alert=True)
             return
-        known = await storage.list_known_chats()
+        known, auto, account_id = await fetch_known(auto)
         sorted_items = sorted(known.items(), key=lambda item: item[1].get("title", ""))
         index_lookup = {int(chat_id_str): idx for idx, (chat_id_str, _) in enumerate(sorted_items)}
         if chat_id in index_lookup:
             page = index_lookup[chat_id] // GROUPS_PAGE_SIZE
-    known = await storage.list_known_chats()
+    known, auto, account_id = await fetch_known(auto)
     title_raw = (known.get(str(chat_id)) or {}).get("title") or str(chat_id)
     title = quote_html(title_raw)
-    selected = await storage.toggle_target_chat(user_id, chat_id, title_raw)
+    selected = await storage.toggle_target_chat(user_id, chat_id, title_raw, account_id=account_id)
+    require_targets = await should_require_targets(call.bot, user_id)
     await storage.ensure_constraints(
         user_id=user_id,
-        require_targets=call.bot.get("user_sender") is None,
+        require_targets=require_targets,
     )
     auto_sender: AutoSender = call.bot["auto_sender"]
     await auto_sender.refresh_user(user_id)
-    known = await storage.list_known_chats()
-    auto = await storage.get_auto(user_id)
+    known, auto, account_id = await fetch_known(None)
     reply_text = (
         f"{GROUPS_BASE_TEXT}\n\n"
         f"Чат {'добавлен в' if selected else 'убран из'} рассылки: {title}\n"
@@ -1277,11 +1720,13 @@ async def on_startup(dispatcher: Dispatcher) -> None:
             )
             user_sender_instance = None
             dispatcher.bot["user_sender"] = None
+    account_manager: Optional[AccountManager] = dispatcher.bot.get("account_manager")
     auto_sender = AutoSender(
         dispatcher.bot,
         storage,
         PAYMENT_VALID_DAYS,
         user_sender=user_sender_instance,
+        account_manager=account_manager,
     )
     dispatcher.bot["auto_sender"] = auto_sender
     if user_sender_instance:
@@ -1302,6 +1747,9 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
     if user_sender_instance:
         await user_sender_instance.stop()
+    account_manager: Optional[AccountManager] = dispatcher.bot.get("account_manager")
+    if account_manager:
+        await account_manager.stop_all()
     await dispatcher.storage.close()
     await dispatcher.storage.wait_closed()
 

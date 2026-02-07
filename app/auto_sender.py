@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 from aiogram import Bot
 from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
 
+from .account_manager import AccountManager
 from .storage import Storage
 from .user_sender import UserSender
 
@@ -17,11 +18,13 @@ class AutoSender:
         payment_valid_days: int,
         *,
         user_sender: Optional[UserSender] = None,
+        account_manager: Optional[AccountManager] = None,
     ) -> None:
         self._bot = bot
         self._storage = storage
         self._payment_valid_days = max(0, payment_valid_days)
         self._user_sender = user_sender
+        self._account_manager = account_manager
         self._personal_chats: Dict[int, str] = {}
         self._lock = asyncio.Lock()
         self._tasks: Dict[int, asyncio.Task[None]] = {}
@@ -46,7 +49,7 @@ class AutoSender:
             return
         await self._storage.ensure_constraints(
             user_id=user_id,
-            require_targets=self._user_sender is None,
+            require_targets=self._user_sender is None and not auto.get("sender_account_id"),
         )
         auto = await self._storage.get_auto(user_id)
         if not auto.get("is_enabled"):
@@ -68,6 +71,30 @@ class AutoSender:
     async def stop_all(self) -> None:
         for user_id in list(self._tasks.keys()):
             await self.stop_user(user_id)
+
+    async def _deliver_message(
+        self,
+        user_id: int,
+        chat_id: int,
+        message: str,
+        account_id: Optional[int],
+    ) -> None:
+        if account_id is not None:
+            if not self._account_manager:
+                raise RuntimeError("Личный аккаунт для рассылки недоступен.")
+            account = await self._storage.get_user_account(account_id, owner_id=user_id)
+            if not account:
+                raise RuntimeError("Аккаунт удалён или недоступен.")
+            session = account.get("session")
+            if not session:
+                raise RuntimeError("У аккаунта отсутствует активная сессия.")
+            sender = await self._account_manager.get_sender(account_id, session)
+            await sender.send_message(chat_id, message)
+            return
+        if self._user_sender:
+            await self._user_sender.send_message(chat_id, message)
+            return
+        await self._bot.send_message(chat_id, message)
 
     async def _start_task_for_user(self, user_id: int) -> None:
         async with self._lock:
@@ -95,14 +122,12 @@ class AutoSender:
                     await self._storage.set_auto_enabled(user_id, False)
                     break
 
+                account_id = auto.get("sender_account_id")
                 success = 0
                 errors: List[str] = []
                 for chat_id in targets:
                     try:
-                        if self._user_sender:
-                            await self._user_sender.send_message(chat_id, message)
-                        else:
-                            await self._bot.send_message(chat_id, message)
+                        await self._deliver_message(user_id, chat_id, message, account_id)
                         success += 1
                     except (BotKicked, ChatNotFound, Unauthorized) as exc:
                         errors.append(f"Недоступен чат {chat_id}: {exc}")
@@ -158,6 +183,14 @@ class AutoSender:
         self._personal_chats = personal
 
     async def _resolve_targets(self, auto: dict) -> List[int]:
+        account_id = auto.get("sender_account_id")
+        if account_id is not None:
+            known = await self._storage.list_known_chats(account_id=account_id, owner_id=auto["user_id"])
+            available_ids = {int(chat_id) for chat_id in known.keys()}
+            selected = [int(chat_id) for chat_id in auto.get("target_chat_ids") or []]
+            if selected:
+                return [chat_id for chat_id in selected if chat_id in available_ids]
+            return list(available_ids)
         if self._user_sender:
             personal_chats = await self.get_personal_chats(refresh=not self._personal_chats)
             available_ids = set(personal_chats.keys())

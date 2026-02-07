@@ -17,3 +17,9 @@ class AdminLoginStates(StatesGroup):
 
 class AdminManualPaymentStates(StatesGroup):
     waiting_for_user = State()
+
+
+class AccountStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_password = State()
