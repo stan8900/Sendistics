@@ -338,6 +338,128 @@ class Storage:
             self._commit()
             return True
 
+    async def register_audience_dump(
+        self,
+        owner_user_id: int,
+        *,
+        source: str,
+        file_path: str,
+        total_users: int,
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            dump_id = uuid4().hex
+            created_at = datetime.utcnow().isoformat()
+            self._execute(
+                """
+                INSERT INTO audience_dumps (
+                    id, owner_user_id, source, file_path, total_users, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (dump_id, owner_user_id, source, file_path, int(total_users), created_at),
+            )
+            self._commit()
+            return self._fetch_audience_dump_locked(dump_id)
+
+    async def list_audience_dumps(self, owner_user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        async with self._lock:
+            rows = self._execute(
+                """
+                SELECT id, owner_user_id, source, file_path, total_users, created_at
+                FROM audience_dumps
+                WHERE owner_user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (owner_user_id, max(1, int(limit))),
+            ).fetchall()
+            return [self._row_to_audience_dump(row) for row in rows]
+
+    async def create_invite_job(
+        self,
+        owner_user_id: int,
+        *,
+        target_chat: str,
+        usernames_file: str,
+        settings: Dict[str, Any],
+        total_users: int,
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            job_id = uuid4().hex
+            created_at = datetime.utcnow().isoformat()
+            self._execute(
+                """
+                INSERT INTO invite_jobs (
+                    id, owner_user_id, target_chat, usernames_file,
+                    status, total_users, invited_count, failed_count,
+                    last_error, settings_json, created_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, 0, 0, NULL, ?, ?)
+                """,
+                (
+                    job_id,
+                    owner_user_id,
+                    target_chat,
+                    usernames_file,
+                    int(total_users),
+                    json.dumps(settings, ensure_ascii=False),
+                    created_at,
+                ),
+            )
+            self._commit()
+            return self._fetch_invite_job_locked(job_id)
+
+    async def update_invite_job(self, job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+        allowed = {
+            "status",
+            "invited_count",
+            "failed_count",
+            "last_error",
+            "started_at",
+            "finished_at",
+            "settings",
+        }
+        updates: List[str] = []
+        params: List[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            column = "settings_json" if key == "settings" else key
+            updates.append(f"{column} = ?")
+            if key == "settings":
+                params.append(json.dumps(value, ensure_ascii=False))
+            else:
+                params.append(value)
+        if not updates:
+            return await self.get_invite_job(job_id)
+        async with self._lock:
+            self._execute(
+                f"""
+                UPDATE invite_jobs
+                SET {', '.join(updates)}
+                WHERE id = ?
+                """,
+                (*params, job_id),
+            )
+            self._commit()
+            return self._fetch_invite_job_locked(job_id)
+
+    async def list_invite_jobs(self, owner_user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        async with self._lock:
+            rows = self._execute(
+                """
+                SELECT *
+                FROM invite_jobs
+                WHERE owner_user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (owner_user_id, max(1, int(limit))),
+            ).fetchall()
+            return [self._row_to_invite_job(row) for row in rows]
+
+    async def get_invite_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            return self._fetch_invite_job_locked(job_id)
+
     async def update_user_account_session(
         self,
         owner_id: int,
@@ -1039,6 +1161,43 @@ class Storage:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS audience_dumps (
+                id TEXT PRIMARY KEY,
+                owner_user_id BIGINT NOT NULL,
+                source TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                total_users INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS invite_jobs (
+                id TEXT PRIMARY KEY,
+                owner_user_id BIGINT NOT NULL,
+                target_chat TEXT NOT NULL,
+                usernames_file TEXT NOT NULL,
+                status TEXT NOT NULL,
+                total_users INTEGER NOT NULL DEFAULT 0,
+                invited_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                settings_json TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_invite_jobs_owner
+            ON invite_jobs(owner_user_id)
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS sessions (
                 user_id BIGINT PRIMARY KEY,
                 role TEXT NOT NULL,
@@ -1186,6 +1345,24 @@ class Storage:
         ).fetchone()
         return self._row_to_payment(row) if row else None
 
+    def _fetch_audience_dump_locked(self, dump_id: str) -> Optional[Dict[str, Any]]:
+        row = self._execute(
+            """
+            SELECT id, owner_user_id, source, file_path, total_users, created_at
+            FROM audience_dumps
+            WHERE id = ?
+            """,
+            (dump_id,),
+        ).fetchone()
+        return self._row_to_audience_dump(row) if row else None
+
+    def _fetch_invite_job_locked(self, job_id: str) -> Optional[Dict[str, Any]]:
+        row = self._execute(
+            "SELECT * FROM invite_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        return self._row_to_invite_job(row) if row else None
+
     def _row_to_payment(self, row: Any) -> Dict[str, Any]:
         data = dict(row)
         data["resolved_by"] = {
@@ -1197,4 +1374,23 @@ class Storage:
     def _row_to_account(self, row: Any) -> Dict[str, Any]:
         data = dict(row)
         data["owner_user_id"] = int(data["owner_user_id"])
+        return data
+
+    def _row_to_audience_dump(self, row: Any) -> Dict[str, Any]:
+        data = dict(row)
+        data["owner_user_id"] = int(data["owner_user_id"])
+        data["total_users"] = int(data["total_users"] or 0)
+        return data
+
+    def _row_to_invite_job(self, row: Any) -> Dict[str, Any]:
+        data = dict(row)
+        data["owner_user_id"] = int(data["owner_user_id"])
+        data["total_users"] = int(data["total_users"] or 0)
+        data["invited_count"] = int(data["invited_count"] or 0)
+        data["failed_count"] = int(data["failed_count"] or 0)
+        settings_raw = data.pop("settings_json", None)
+        try:
+            data["settings"] = json.loads(settings_raw) if settings_raw else {}
+        except json.JSONDecodeError:
+            data["settings"] = {}
         return data

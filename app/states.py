@@ -23,3 +23,18 @@ class AccountStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_code = State()
     waiting_for_password = State()
+
+
+class ParserStates(StatesGroup):
+    waiting_for_channel = State()
+    waiting_for_limit = State()
+
+
+class InviteStates(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_target = State()
+    waiting_for_limits = State()
+
+
+class GroupParserStates(StatesGroup):
+    waiting_for_group = State()

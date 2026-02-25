@@ -16,10 +16,21 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from dotenv import load_dotenv
 
 from app.account_manager import AccountManager
+from app.audience_parser import AudienceParser
 from app.auto_sender import AutoSender
+from app.invite_engine import InviteEngine
 from app.keyboards import GROUPS_PAGE_SIZE, accounts_keyboard, auto_menu_keyboard, groups_keyboard, main_menu_keyboard
 from app.pdf_reports import build_payments_pdf
-from app.states import AutoCampaignStates, PaymentStates, AdminLoginStates, AdminManualPaymentStates, AccountStates
+from app.states import (
+    AccountStates,
+    AdminLoginStates,
+    AdminManualPaymentStates,
+    AutoCampaignStates,
+    GroupParserStates,
+    InviteStates,
+    ParserStates,
+    PaymentStates,
+)
 from app.storage import Storage
 from app.user_sender import UserSender
 from telethon import TelegramClient
@@ -113,6 +124,16 @@ if bot["personal_api_available"] and tg_user_api_id and tg_user_api_hash:
     bot["account_manager"] = AccountManager(tg_user_api_id, tg_user_api_hash)
 else:
     bot["account_manager"] = None
+bot["audience_parser"] = AudienceParser(
+    storage,
+    base_dir=BASE_DIR,
+    user_sender=user_sender,
+    account_manager=bot["account_manager"],
+)
+if bot["account_manager"]:
+    bot["invite_engine"] = InviteEngine(storage, bot["account_manager"])
+else:
+    bot["invite_engine"] = None
 
 PAYMENT_AMOUNT = 100_000
 PAYMENT_CURRENCY = "UZS"
@@ -935,6 +956,56 @@ async def cmd_admin_payments(message: types.Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
+@dp.message_handler(commands=["dumps"], state="*")
+async def cmd_list_dumps(message: types.Message, state: FSMContext) -> None:
+    await state.finish()
+    if not await is_admin_user(message.from_user.id):
+        await message.answer("Команда доступна только администраторам.")
+        return
+    dumps = await storage.list_audience_dumps(message.from_user.id, limit=10)
+    if not dumps:
+        await message.answer("Пока нет сохранённых выгрузок аудитории.")
+        await send_main_menu(message)
+        return
+    lines = ["🗂 <b>Последние выгрузки</b>"]
+    for dump in dumps:
+        created = format_datetime(dump.get("created_at"))
+        lines.append(
+            f"#{dump['id'][:6]} — {dump['total_users']} логинов, источник {dump['source']} ({created})"
+        )
+    await message.answer("\n".join(lines))
+    await send_main_menu(message)
+
+
+@dp.message_handler(commands=["jobs"], state="*")
+async def cmd_list_jobs(message: types.Message, state: FSMContext) -> None:
+    await state.finish()
+    if not await is_admin_user(message.from_user.id):
+        await message.answer("Команда доступна только администраторам.")
+        return
+    jobs = await storage.list_invite_jobs(message.from_user.id, limit=10)
+    if not jobs:
+        await message.answer("Нет активных или завершённых задач инвайта.")
+        await send_main_menu(message)
+        return
+    lines = ["📦 <b>Задачи инвайта</b>"]
+    for job in jobs:
+        status = job.get("status")
+        status_emoji = {
+            "pending": "⏳",
+            "running": "⚙️",
+            "completed": "✅",
+            "failed": "❌",
+        }.get(status, "•")
+        created = format_datetime(job.get("created_at"))
+        lines.append(
+            f"{status_emoji} #{job['id'][:6]} — {job['invited_count']}/{job['total_users']} приглашено, "
+            f"чат {job['target_chat']} ({created})"
+        )
+    await message.answer("\n".join(lines))
+    await send_main_menu(message)
+
+
 @dp.message_handler(commands=["админ"], state="*")
 async def cmd_admin_login_ru(message: types.Message, state: FSMContext) -> None:
     await cmd_admin_login(message, state)
@@ -965,11 +1036,332 @@ async def process_admin_code(message: types.Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
+@dp.message_handler(state=ParserStates.waiting_for_channel, content_types=types.ContentTypes.TEXT)
+async def parser_wait_channel(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await state.finish()
+        await message.answer("Недостаточно прав для парсинга.")
+        return
+    if await handle_possible_cancel(message, state):
+        return
+    source = (message.text or "").strip()
+    if not source:
+        await message.answer("Укажите ссылку или @username канала.")
+        return
+    await state.update_data(parser_source=source)
+    await state.set_state(ParserStates.waiting_for_limit.state)
+    await message.answer("Сколько последних постов обрабатывать? Укажите число от 1 до 500.")
+
+
+@dp.message_handler(state=ParserStates.waiting_for_limit, content_types=types.ContentTypes.TEXT)
+async def parser_wait_limit(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await state.finish()
+        await message.answer("Недостаточно прав для парсинга.")
+        return
+    if await handle_possible_cancel(message, state):
+        return
+    text = (message.text or "").strip()
+    try:
+        limit = max(1, min(500, int(text)))
+    except ValueError:
+        await message.answer("Введите число от 1 до 500. Например: 50")
+        return
+    data = await state.get_data()
+    source = data.get("parser_source")
+    if not source:
+        await state.finish()
+        await message.answer("Не удалось определить канал. Запустите парсер снова.")
+        await send_main_menu(message)
+        return
+    parser: Optional[AudienceParser] = message.bot.get("audience_parser")
+    if not parser:
+        await state.finish()
+        await message.answer("Парсер недоступен: подключите личный API или аккаунт.")
+        await send_main_menu(message)
+        return
+    await message.answer("🔍 Начинаю собирать комментарии, это может занять пару минут...")
+    try:
+        dump = await parser.parse_comments(
+            message.from_user.id,
+            source=source,
+            limit=limit,
+        )
+    except Exception as exc:  # pragma: no cover - network operations
+        logger.exception("Не удалось выполнить парсинг %s для %s", source, message.from_user.id)
+        await message.answer(f"Не удалось выполнить парсинг: {exc}")
+    else:
+        path = Path(dump["file_path"])
+        caption = (
+            f"Готово! Найдено {dump['total_users']} логинов.\n"
+            f"Источник: {dump['source']}\n"
+            "Файл сохранён в /data/dumps."
+        )
+        if path.exists():
+            try:
+                await message.bot.send_document(message.chat.id, InputFile(path), caption=caption)
+            except Exception:
+                logger.exception("Не удалось отправить файл %s", path)
+                await message.answer(f"{caption}\nФайл: {path}")
+        else:
+            await message.answer(caption)
+    await state.finish()
+    await send_main_menu(message)
+
+
+@dp.message_handler(state=GroupParserStates.waiting_for_group, content_types=types.ContentTypes.TEXT)
+async def group_parser_wait_choice(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await state.finish()
+        await message.answer("Недостаточно прав для парсинга.")
+        return
+    if await handle_possible_cancel(message, state):
+        return
+    parser: Optional[AudienceParser] = message.bot.get("audience_parser")
+    if not parser:
+        await state.finish()
+        await message.answer("Парсер недоступен: подключите личный API или аккаунт.")
+        await send_main_menu(message)
+        return
+    data = await state.get_data()
+    groups = data.get("group_parser_choices") or []
+    choice = (message.text or "").strip()
+    selected: Optional[Dict[str, Any]] = None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(groups):
+            selected = groups[idx - 1]
+    else:
+        lookup = choice.lstrip("@").lower()
+        for group in groups:
+            username = (group.get("username") or "").lower()
+            if username and username == lookup:
+                selected = group
+                break
+            if str(group["id"]) == choice:
+                selected = group
+                break
+    target = None
+    source_label = choice
+    if selected:
+        target = selected.get("username") or int(selected["id"])
+        source_label = selected.get("title") or str(selected["id"])
+    else:
+        if choice.startswith("@"):
+            target = choice
+        else:
+            try:
+                target = int(choice)
+            except ValueError:
+                target = choice
+    await message.answer("👥 Начинаю собирать участников выбранной группы...")
+    try:
+        dump = await parser.parse_group_members(
+            message.from_user.id,
+            group=target,
+        )
+    except Exception as exc:  # pragma: no cover - network work
+        logger.exception("Не удалось выполнить групповой парсинг %s", target)
+        await message.answer(f"Не удалось собрать участников: {exc}")
+    else:
+        path = Path(dump["file_path"])
+        caption = (
+            f"Готово! Собрано {dump['total_users']} участников.\n"
+            f"Группа: {source_label}\n"
+            "Файл сохранён в /data/dumps."
+        )
+        if path.exists():
+            try:
+                await message.bot.send_document(message.chat.id, InputFile(path), caption=caption)
+            except Exception:
+                logger.exception("Не удалось отправить файл %s", path)
+                await message.answer(f"{caption}\nФайл: {path}")
+        else:
+            await message.answer(caption)
+    await state.finish()
+    await send_main_menu(message)
+
+
+@dp.message_handler(state=InviteStates.waiting_for_file, content_types=types.ContentTypes.ANY)
+async def invite_wait_file(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await state.finish()
+        await message.answer("Недостаточно прав для запуска инвайта.")
+        return
+    if await handle_possible_cancel(message, state):
+        return
+    document = message.document
+    if not document:
+        await message.answer("Пришлите .txt файл с логинами (по одному @username в строке).")
+        return
+    uploads_dir = BASE_DIR / "data" / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    original_name = document.file_name or "usernames.txt"
+    safe_name = "".join(ch for ch in original_name if ch.isalnum() or ch in ("_", "-", ".")) or "usernames.txt"
+    path = uploads_dir / f"{timestamp}_{safe_name}"
+    await document.download(destination_file=str(path))
+    await state.update_data(invite_file=str(path))
+    await state.set_state(InviteStates.waiting_for_target.state)
+    await message.answer("Файл сохранён. Укажите @username или ссылку на чат/канал, куда будем приглашать.")
+
+
+@dp.message_handler(state=InviteStates.waiting_for_target, content_types=types.ContentTypes.TEXT)
+async def invite_wait_target(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await state.finish()
+        await message.answer("Недостаточно прав для запуска инвайта.")
+        return
+    if await handle_possible_cancel(message, state):
+        return
+    target = (message.text or "").strip()
+    if not target:
+        await message.answer("Укажите ссылку или @username чата.")
+        return
+    await state.update_data(invite_target=target)
+    await state.set_state(InviteStates.waiting_for_limits.state)
+    await message.answer(
+        "Укажите лимиты через пробел: <b>инвайтов_на_аккаунт задержка_сек потоки</b>.\n"
+        "Например: <code>20 8 3</code> — по 20 приглашений на аккаунт, задержка 8 секунд, 3 аккаунта параллельно."
+    )
+
+
+@dp.message_handler(state=InviteStates.waiting_for_limits, content_types=types.ContentTypes.TEXT)
+async def invite_wait_limits(message: types.Message, state: FSMContext) -> None:
+    if not await is_admin_user(message.from_user.id):
+        await state.finish()
+        await message.answer("Недостаточно прав для запуска инвайта.")
+        return
+    if await handle_possible_cancel(message, state):
+        return
+    parts = (message.text or "").replace(",", " ").split()
+    try:
+        invites_per_account = max(1, int(parts[0]))
+    except (IndexError, ValueError):
+        invites_per_account = 10
+    try:
+        delay_seconds = max(0.5, float(parts[1]))
+    except (IndexError, ValueError):
+        delay_seconds = 5.0
+    try:
+        thread_limit = max(1, int(parts[2]))
+    except (IndexError, ValueError):
+        thread_limit = 1
+    data = await state.get_data()
+    file_path_raw = data.get("invite_file")
+    target = data.get("invite_target")
+    if not file_path_raw or not target:
+        await state.finish()
+        await message.answer("Данные не найдены, начните настройку заново.")
+        await send_main_menu(message)
+        return
+    engine: Optional[InviteEngine] = message.bot.get("invite_engine")
+    if not engine:
+        await state.finish()
+        await message.answer("Инвайтер недоступен: подключите личные аккаунты.")
+        await send_main_menu(message)
+        return
+    jitter = max(0.5, delay_seconds * 0.4)
+    await message.answer(
+        "🚀 Задача поставлена. Приглашения начнутся после подготовки сессий.\n"
+        "Проверить статус можно командой /jobs."
+    )
+    try:
+        job = await engine.start_job(
+            message.from_user.id,
+            target_chat=target,
+            usernames_file=Path(file_path_raw),
+            settings={
+                "invites_per_account": invites_per_account,
+                "delay_seconds": delay_seconds,
+                "thread_limit": thread_limit,
+                "delay_jitter": jitter,
+            },
+        )
+        await message.answer(
+            f"Задача #{job['id'][:6]}: ожидается {job['total_users']} приглашений в {target}."
+        )
+    except Exception as exc:  # pragma: no cover - MTProto operations
+        logger.exception("Не удалось запустить инвайт %s", target)
+        await message.answer(f"Не удалось запустить задачу: {exc}")
+    await state.finish()
+    await send_main_menu(message)
+
+
 @dp.callback_query_handler(lambda c: c.data == "main:auto")
 async def cb_main_auto(call: types.CallbackQuery) -> None:
     await call.answer()
     auto_data = await storage.get_auto(call.from_user.id)
     await show_auto_menu(call.message, auto_data, user_id=call.from_user.id)
+
+
+@dp.callback_query_handler(lambda c: c.data == "main:parser")
+async def cb_main_parser(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    parser: Optional[AudienceParser] = call.bot.get("audience_parser")
+    if not parser:
+        await call.answer("Парсер недоступен. Добавьте личный API или аккаунт.", show_alert=True)
+        return
+    await state.set_state(ParserStates.waiting_for_channel.state)
+    await call.message.answer(
+        "Отправьте @username или ссылку на канал, из которого нужно собрать комментарии.\n"
+        "Используйте /cancel для выхода."
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "main:group_parser")
+async def cb_main_group_parser(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    parser: Optional[AudienceParser] = call.bot.get("audience_parser")
+    if not parser:
+        await call.answer("Парсер недоступен. Добавьте личный API или аккаунт.", show_alert=True)
+        return
+    try:
+        groups = await parser.list_personal_groups(call.from_user.id)
+    except Exception as exc:  # pragma: no cover - network
+        logger.exception("Не удалось получить список групп для парсинга.")
+        await call.answer(f"Ошибка подключения к аккаунту: {exc}", show_alert=True)
+        return
+    if not groups:
+        await call.answer("Нет доступных групп в личной сессии.", show_alert=True)
+        return
+    await GroupParserStates.waiting_for_group.set()
+    await state.update_data(group_parser_choices=groups)
+    lines = [
+        "👥 <b>Выберите группу для парсинга</b>",
+        "Отправьте номер из списка или @username/ID группы. /cancel — отмена.",
+        "",
+    ]
+    for idx, group in enumerate(groups, start=1):
+        mention = f"@{group['username']}" if group.get("username") else group["id"]
+        lines.append(f"{idx}. {quote_html(group['title'])} — {mention}")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "main:inviter")
+async def cb_main_inviter(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    invite_engine: Optional[InviteEngine] = call.bot.get("invite_engine")
+    if not invite_engine:
+        await call.answer(
+            "Инвайтер недоступен: подключите хотя бы один личный аккаунт через личный API.",
+            show_alert=True,
+        )
+        return
+    await state.set_state(InviteStates.waiting_for_file.state)
+    await call.message.answer(
+        "Загрузите .txt файл с логинами (по одному @username в строке). "
+        "Команда /cancel отменяет настройку."
+    )
+    await call.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:stats")
