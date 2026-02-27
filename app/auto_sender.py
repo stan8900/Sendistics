@@ -88,7 +88,7 @@ class AutoSender:
             session = account.get("session")
             if not session:
                 raise RuntimeError("У аккаунта отсутствует активная сессия.")
-            sender = await self._account_manager.get_sender(account_id, session)
+            sender = await self._account_manager.get_sender(account)
             await sender.send_message(chat_id, message)
             return
         if self._user_sender:

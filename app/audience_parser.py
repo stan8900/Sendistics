@@ -190,7 +190,7 @@ class AudienceParser:
             if account_id and self._account_manager:
                 account = await self._storage.get_user_account(account_id, owner_id=owner_user_id)
                 if account:
-                    sender = await self._account_manager.get_sender(account["id"], account["session"])
+                    sender = await self._account_manager.get_sender(account)
                     await sender.start()
                     return sender.client, f"account #{account['id']}"
             if self._user_sender:
@@ -200,7 +200,7 @@ class AudienceParser:
                 accounts = await self._storage.list_user_accounts(owner_user_id)
                 if accounts:
                     account = accounts[0]
-                    sender = await self._account_manager.get_sender(account["id"], account["session"])
+                    sender = await self._account_manager.get_sender(account)
                     await sender.start()
                     return sender.client, f"account #{account['id']}"
         raise RuntimeError("Нет доступных аккаунтов для подключения к MTProto.")

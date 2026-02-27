@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Set
 
 from aiogram import Bot, Dispatcher, types
@@ -15,7 +16,7 @@ from aiogram.utils.markdown import hbold, quote_html
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from dotenv import load_dotenv
 
-from app.account_manager import AccountManager
+from app.account_manager import AccountManager, get_account_proxy
 from app.audience_parser import AudienceParser
 from app.auto_sender import AutoSender
 from app.invite_engine import InviteEngine
@@ -206,7 +207,7 @@ async def refresh_account_chats(bot_obj: Bot, owner_id: int, account_id: int) ->
     if not session:
         return False
     try:
-        sender = await manager.get_sender(account_id, session)
+        sender = await manager.get_sender(account)
         dialogs = await sender.list_accessible_chats()
     except Exception:
         logger.exception("Не удалось обновить список чатов аккаунта %s", account_id)
@@ -293,6 +294,70 @@ def format_account_display(account: Dict[str, Any]) -> str:
             return f"{title} ({phone})"
         return title
     return phone or "Аккаунт"
+
+
+SUPPORTED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
+PROXY_DISABLE_WORDS = {"off", "0", "none", "нет", "disable", "remove", "stop", "no"}
+
+
+def format_proxy_display(proxy: Dict[str, Any]) -> str:
+    proxy_type = (proxy.get("type") or "socks5").lower()
+    host = proxy.get("host") or "—"
+    port = proxy.get("port") or "—"
+    username = proxy.get("username") or ""
+    password = proxy.get("password") or ""
+    creds = ""
+    if username:
+        creds = username
+        if password:
+            creds += ":***"
+        creds += "@"
+    return f"{proxy_type}://{creds}{host}:{port}"
+
+
+def parse_proxy_string(raw: str) -> Dict[str, Any]:
+    if not raw:
+        raise ValueError("Укажите адрес прокси.")
+    text = raw.strip()
+    scheme = "socks5"
+    username: Optional[str] = None
+    password: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    if "://" in text:
+        parsed = urlparse(text)
+        scheme = (parsed.scheme or "socks5").lower()
+        if scheme not in SUPPORTED_PROXY_SCHEMES:
+            raise ValueError("Поддерживаются только схемы socks5, socks4 и http.")
+        host = parsed.hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("Порт должен быть числом.")
+        username = parsed.username or None
+        password = parsed.password or None
+    else:
+        parts = [part.strip() for part in text.split(":")]
+        if len(parts) < 2:
+            raise ValueError("Укажите хост и порт через двоеточие.")
+        host = parts[0]
+        try:
+            port = int(parts[1])
+        except ValueError:
+            raise ValueError("Порт должен быть числом.")
+        if len(parts) >= 3 and parts[2]:
+            username = parts[2]
+        if len(parts) >= 4 and parts[3]:
+            password = parts[3]
+    if not host or port is None:
+        raise ValueError("Некорректный адрес прокси.")
+    return {
+        "type": scheme,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+    }
 
 
 def normalize_phone(raw: str) -> Optional[str]:
@@ -619,7 +684,8 @@ async def show_account_menu(message: types.Message, *, user_id: int) -> None:
     if accounts:
         for account in accounts:
             marker = "✅" if active_account_id is not None and int(account["id"]) == int(active_account_id) else "•"
-            lines.append(f"{marker} {format_account_display(account)}")
+            proxy_suffix = " 🌐" if get_account_proxy(account) else ""
+            lines.append(f"{marker} {format_account_display(account)}{proxy_suffix}")
     else:
         lines.append("Пока нет подключённых номеров. Нажмите «➕ Добавить номер», чтобы пройти подтверждение.")
     text = "\n".join(lines)
@@ -701,6 +767,37 @@ async def cb_accounts_set(call: types.CallbackQuery) -> None:
     auto_sender: AutoSender = call.bot["auto_sender"]
     await auto_sender.refresh_user(user_id)
     await show_account_menu(call.message, user_id=user_id)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("accounts:proxy:"), state="*")
+async def cb_accounts_proxy(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not personal_api_ready(call.bot):
+        await call.answer("Личные аккаунты отключены.", show_alert=True)
+        return
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        await call.answer("Некорректная команда.", show_alert=True)
+        return
+    try:
+        account_id = int(parts[2])
+    except ValueError:
+        await call.answer("Некорректный идентификатор аккаунта.", show_alert=True)
+        return
+    account = await storage.get_user_account(account_id, owner_id=call.from_user.id)
+    if not account:
+        await call.answer("Аккаунт недоступен.", show_alert=True)
+        return
+    proxy = get_account_proxy(account)
+    current_status = format_proxy_display(proxy) if proxy else "не настроен"
+    await AccountStates.waiting_for_proxy.set()
+    await state.update_data(proxy_account_id=account_id)
+    await call.answer()
+    await call.message.answer(
+        "Отправьте параметры прокси одним сообщением.\n"
+        "Формат: socks5://login:pass@host:port или host:port[:login[:password]].\n"
+        "Поддерживаются схемы socks5/socks4/http. Чтобы отключить прокси, напишите off.\n\n"
+        f"Текущее состояние: {current_status}."
+    )
 
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("accounts:refresh:"))
@@ -841,6 +938,42 @@ async def handle_account_password(message: types.Message, state: FSMContext) -> 
         await message.reply("Не удалось подтвердить пароль. Попробуйте снова.")
         return
     await finalize_account_login(message, state, pending)
+
+
+@dp.message_handler(state=AccountStates.waiting_for_proxy, content_types=types.ContentTypes.TEXT)
+async def handle_account_proxy_input(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
+    data = await state.get_data()
+    account_id = data.get("proxy_account_id")
+    if not account_id:
+        await message.reply("Аккаунт не выбран. Вернитесь к списку номеров и повторите попытку.")
+        await state.finish()
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply("Укажите адрес прокси или напишите off для отключения.")
+        return
+    lowered = text.lower()
+    if lowered in PROXY_DISABLE_WORDS:
+        proxy = None
+    else:
+        try:
+            proxy = parse_proxy_string(text)
+        except ValueError as exc:
+            await message.reply(str(exc))
+            return
+    updated = await storage.update_user_account_proxy(message.from_user.id, int(account_id), proxy=proxy)
+    if not updated:
+        await message.reply("Аккаунт не найден или недоступен.")
+        await state.finish()
+        return
+    if proxy:
+        await message.answer(f"Прокси сохранён: {format_proxy_display(proxy)}")
+    else:
+        await message.answer("Прокси отключён. Трафик будет идти без обхода.")
+    await state.finish()
+    await show_account_menu(message, user_id=message.from_user.id)
 
 
 async def finalize_account_login(message: types.Message, state: FSMContext, pending: PendingAccountLogin) -> None:

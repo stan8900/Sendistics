@@ -23,6 +23,7 @@ class AccountStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_code = State()
     waiting_for_password = State()
+    waiting_for_proxy = State()
 
 
 class ParserStates(StatesGroup):

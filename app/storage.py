@@ -248,6 +248,7 @@ class Storage:
             rows = self._execute(
                 """
                 SELECT id, owner_user_id, phone, session, title, username, last_synced_at,
+                       proxy_type, proxy_host, proxy_port, proxy_username, proxy_password,
                        created_at, updated_at
                 FROM user_accounts
                 WHERE owner_user_id = ?
@@ -267,6 +268,7 @@ class Storage:
             row = self._execute(
                 """
                 SELECT id, owner_user_id, phone, session, title, username, last_synced_at,
+                       proxy_type, proxy_host, proxy_port, proxy_username, proxy_password,
                        created_at, updated_at
                 FROM user_accounts
                 WHERE id = ?
@@ -295,27 +297,58 @@ class Storage:
                 cur = self._execute(
                     """
                     INSERT INTO user_accounts (
-                        owner_user_id, phone, session, title, username,
+                        owner_user_id, phone, session, title, username, last_synced_at,
+                        proxy_type, proxy_host, proxy_port, proxy_username, proxy_password,
                         created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (owner_id, phone, session, title, username, now, now),
+                    (
+                        owner_id,
+                        phone,
+                        session,
+                        title,
+                        username,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        now,
+                        now,
+                    ),
                 )
                 new_id = cur.fetchone()["id"]
             else:
                 cur = self._execute(
                     """
                     INSERT INTO user_accounts (
-                        owner_user_id, phone, session, title, username,
+                        owner_user_id, phone, session, title, username, last_synced_at,
+                        proxy_type, proxy_host, proxy_port, proxy_username, proxy_password,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (owner_id, phone, session, title, username, now, now),
+                    (
+                        owner_id,
+                        phone,
+                        session,
+                        title,
+                        username,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        now,
+                        now,
+                    ),
                 )
                 new_id = cur.lastrowid
             self._commit()
-            return await self.get_user_account(int(new_id))
+            account_id = int(new_id)
+        return await self.get_user_account(account_id)
 
     async def delete_user_account(self, owner_id: int, account_id: int) -> bool:
         async with self._lock:
@@ -337,6 +370,41 @@ class Storage:
             )
             self._commit()
             return True
+
+    async def update_user_account_proxy(
+        self,
+        owner_id: int,
+        account_id: int,
+        *,
+        proxy: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            row = self._execute(
+                "SELECT owner_user_id FROM user_accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if not row or int(row["owner_user_id"]) != int(owner_id):
+                return None
+            now = datetime.utcnow().isoformat()
+            params = (
+                proxy.get("type") if proxy else None,
+                proxy.get("host") if proxy else None,
+                int(proxy.get("port")) if proxy and proxy.get("port") is not None else None,
+                proxy.get("username") if proxy else None,
+                proxy.get("password") if proxy else None,
+                now,
+                account_id,
+            )
+            self._execute(
+                """
+                UPDATE user_accounts
+                SET proxy_type = ?, proxy_host = ?, proxy_port = ?, proxy_username = ?, proxy_password = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                params,
+            )
+            self._commit()
+        return await self.get_user_account(account_id)
 
     async def register_audience_dump(
         self,
@@ -1046,6 +1114,11 @@ class Storage:
                     title TEXT,
                     username TEXT,
                     last_synced_at TEXT,
+                    proxy_type TEXT,
+                    proxy_host TEXT,
+                    proxy_port INTEGER,
+                    proxy_username TEXT,
+                    proxy_password TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -1062,11 +1135,25 @@ class Storage:
                     title TEXT,
                     username TEXT,
                     last_synced_at TEXT,
+                    proxy_type TEXT,
+                    proxy_host TEXT,
+                    proxy_port INTEGER,
+                    proxy_username TEXT,
+                    proxy_password TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+        proxy_columns = {
+            "proxy_type": "TEXT",
+            "proxy_host": "TEXT",
+            "proxy_port": "INTEGER",
+            "proxy_username": "TEXT",
+            "proxy_password": "TEXT",
+        }
+        for column, definition in proxy_columns.items():
+            self._add_column_if_missing("user_accounts", column, definition)
         self._execute(
             """
             CREATE TABLE IF NOT EXISTS user_account_chats (
@@ -1374,6 +1461,11 @@ class Storage:
     def _row_to_account(self, row: Any) -> Dict[str, Any]:
         data = dict(row)
         data["owner_user_id"] = int(data["owner_user_id"])
+        if data.get("proxy_port") is not None:
+            try:
+                data["proxy_port"] = int(data["proxy_port"])
+            except (TypeError, ValueError):
+                data["proxy_port"] = None
         return data
 
     def _row_to_audience_dump(self, row: Any) -> Dict[str, Any]:

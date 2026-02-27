@@ -57,6 +57,35 @@ class StorageExtensionsTest(unittest.TestCase):
 
         asyncio.run(runner())
 
+    def test_update_account_proxy(self) -> None:
+        async def runner() -> None:
+            account = await self.storage.create_user_account(
+                42,
+                phone="+10000000000",
+                session="session-string",
+                title="Test",
+                username="tester",
+            )
+            proxy = {
+                "type": "socks5",
+                "host": "127.0.0.1",
+                "port": 9050,
+                "username": "user",
+                "password": "pass",
+            }
+            updated = await self.storage.update_user_account_proxy(42, account["id"], proxy=proxy)
+            self.assertEqual(updated["proxy_type"], "socks5")
+            self.assertEqual(updated["proxy_host"], "127.0.0.1")
+            self.assertEqual(updated["proxy_port"], 9050)
+            self.assertEqual(updated["proxy_username"], "user")
+            self.assertEqual(updated["proxy_password"], "pass")
+            cleared = await self.storage.update_user_account_proxy(42, account["id"], proxy=None)
+            self.assertIsNotNone(cleared)
+            self.assertIsNone(cleared["proxy_type"])
+            self.assertIsNone(cleared["proxy_host"])
+
+        asyncio.run(runner())
+
 
 if __name__ == "__main__":
     unittest.main()

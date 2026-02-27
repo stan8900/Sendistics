@@ -132,11 +132,17 @@ def accounts_keyboard(
         account_id = int(account["id"])
         label = account.get("title") or account.get("phone") or f"Аккаунт {account_id}"
         prefix = "✅" if account_id == active_account_id else "➕"
+        has_proxy = bool(account.get("proxy_type") and account.get("proxy_host") and account.get("proxy_port"))
+        suffix = " 🌐" if has_proxy else ""
         rows.append([
             InlineKeyboardButton(
-                f"{prefix} {label[:48]}",
+                f"{prefix} {label[:42]}{suffix}",
                 callback_data=f"accounts:set:{account_id}",
-            )
+            ),
+            InlineKeyboardButton(
+                "🌐 Прокси",
+                callback_data=f"accounts:proxy:{account_id}",
+            ),
         ])
     if active_account_id is not None:
         rows.append([

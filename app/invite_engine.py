@@ -128,7 +128,7 @@ class InviteEngine:
         jitter: float,
         stats: Dict[str, int],
     ) -> None:
-        sender = await self._account_manager.get_sender(account["id"], account["session"])
+        sender = await self._account_manager.get_sender(account)
         await sender.start()
         client = sender.client
         entity = await client.get_entity(target_chat)
