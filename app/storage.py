@@ -1294,6 +1294,14 @@ class Storage:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        self._execute(
+            """
             INSERT INTO auto_config (id, interval_minutes, is_enabled)
             VALUES (1, 60, 0)
             ON CONFLICT (id) DO NOTHING
@@ -1307,6 +1315,40 @@ class Storage:
             """
         )
         self._commit()
+
+    async def get_system_setting(self, key: str) -> Optional[str]:
+        async with self._lock:
+            row = self._execute("SELECT value FROM system_settings WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else None
+
+    async def set_system_setting(self, key: str, value: Optional[str]) -> None:
+        async with self._lock:
+            if value is None:
+                self._execute("DELETE FROM system_settings WHERE key = ?", (key,))
+            else:
+                self._execute(
+                    """
+                    INSERT INTO system_settings (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+            self._commit()
+
+    async def get_shared_proxy(self) -> Optional[Dict[str, Any]]:
+        raw = await self.get_system_setting("shared_proxy")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def set_shared_proxy(self, proxy: Optional[Dict[str, Any]]) -> None:
+        value = json.dumps(proxy) if proxy else None
+        await self.set_system_setting("shared_proxy", value)
 
     def _has_any_data(self) -> bool:
         cur = self._execute("SELECT message, is_enabled FROM auto_config WHERE id = 1").fetchone()

@@ -32,6 +32,9 @@ class AudienceParser:
         self._logger = logging.getLogger(__name__)
         self._client_lock = asyncio.Lock()
 
+    def set_user_sender(self, user_sender: Optional[UserSender]) -> None:
+        self._user_sender = user_sender
+
     async def parse_comments(
         self,
         owner_user_id: int,

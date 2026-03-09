@@ -26,6 +26,10 @@ class AccountStates(StatesGroup):
     waiting_for_proxy = State()
 
 
+class SharedProxyStates(StatesGroup):
+    waiting_for_proxy = State()
+
+
 class ParserStates(StatesGroup):
     waiting_for_channel = State()
     waiting_for_limit = State()

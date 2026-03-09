@@ -31,6 +31,7 @@ from app.states import (
     InviteStates,
     ParserStates,
     PaymentStates,
+    SharedProxyStates,
 )
 from app.storage import Storage
 from app.user_sender import UserSender
@@ -50,6 +51,113 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SUPPORTED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
+PROXY_DISABLE_WORDS = {"off", "0", "none", "нет", "disable", "remove", "stop", "no"}
+
+
+def format_proxy_display(proxy: Dict[str, Any]) -> str:
+    proxy_type = (proxy.get("type") or "socks5").lower()
+    host = proxy.get("host") or "—"
+    port = proxy.get("port") or "—"
+    username = proxy.get("username") or ""
+    password = proxy.get("password") or ""
+    creds = ""
+    if username:
+        creds = username
+        if password:
+            creds += ":***"
+        creds += "@"
+    return f"{proxy_type}://{creds}{host}:{port}"
+
+
+def parse_proxy_string(raw: str) -> Dict[str, Any]:
+    if not raw:
+        raise ValueError("Укажите адрес прокси.")
+    text = raw.strip()
+    scheme = "socks5"
+    username: Optional[str] = None
+    password: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    if "://" in text:
+        parsed = urlparse(text)
+        scheme = (parsed.scheme or "socks5").lower()
+        if scheme not in SUPPORTED_PROXY_SCHEMES:
+            raise ValueError("Поддерживаются только схемы socks5, socks4 и http.")
+        host = parsed.hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("Порт должен быть числом.")
+        username = parsed.username or None
+        password = parsed.password or None
+    else:
+        parts = [part.strip() for part in text.split(":")]
+        if len(parts) < 2:
+            raise ValueError("Укажите хост и порт через двоеточие.")
+        host = parts[0]
+        try:
+            port = int(parts[1])
+        except ValueError:
+            raise ValueError("Порт должен быть числом.")
+        if len(parts) >= 3 and parts[2]:
+            username = parts[2]
+        if len(parts) >= 4 and parts[3]:
+            password = parts[3]
+    if not host or port is None:
+        raise ValueError("Некорректный адрес прокси.")
+    return {
+        "type": scheme,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+    }
+
+
+async def sync_shared_proxy_from_storage(bot_obj: Bot) -> None:
+    if bot_obj.get("shared_proxy_source") == "env":
+        return
+    stored_proxy = await storage.get_shared_proxy()
+    bot_obj["shared_proxy"] = stored_proxy
+    bot_obj["shared_proxy_source"] = "db" if stored_proxy else None
+
+
+async def instantiate_user_sender(bot_obj: Bot) -> Optional[UserSender]:
+    api_id = bot_obj.get("personal_api_id")
+    api_hash = bot_obj.get("personal_api_hash")
+    session = bot_obj.get("personal_session")
+    if not api_id or not api_hash or not session:
+        return None
+    proxy = bot_obj.get("shared_proxy")
+    sender = UserSender(api_id, api_hash, session, proxy=proxy)
+    await sender.start()
+    return sender
+
+
+async def replace_bot_user_sender(bot_obj: Bot) -> Optional[UserSender]:
+    existing: Optional[UserSender] = bot_obj.get("user_sender")
+    if existing:
+        try:
+            await existing.stop()
+        except Exception:
+            logger.exception("Не удалось корректно остановить старую пользовательскую сессию.")
+    try:
+        sender = await instantiate_user_sender(bot_obj)
+    except Exception:
+        logger.exception(
+            "Не удалось подключить пользовательскую сессию Telegram. Сообщения будут отправляться от имени бота."
+        )
+        sender = None
+    bot_obj["user_sender"] = sender
+    audience_parser: Optional[AudienceParser] = bot_obj.get("audience_parser")
+    if audience_parser:
+        audience_parser.set_user_sender(sender)
+    auto_sender: Optional[AutoSender] = bot_obj.get("auto_sender")
+    if auto_sender:
+        await auto_sender.replace_user_sender(sender)
+    return sender
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -97,6 +205,7 @@ storage = create_storage()
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
 tg_user_session = os.getenv("TG_USER_SESSION")
+tg_user_proxy_raw = os.getenv("TG_USER_PROXY")
 tg_user_api_id: Optional[int]
 if tg_user_api_id_raw:
     try:
@@ -106,21 +215,26 @@ if tg_user_api_id_raw:
         tg_user_api_id = None
 else:
     tg_user_api_id = None
-user_sender: Optional[UserSender]
-if tg_user_api_id and tg_user_api_hash and tg_user_session:
-    user_sender = UserSender(tg_user_api_id, tg_user_api_hash, tg_user_session)
-else:
-    user_sender = None
+env_shared_proxy: Optional[Dict[str, Any]] = None
+if tg_user_proxy_raw:
+    try:
+        env_shared_proxy = parse_proxy_string(tg_user_proxy_raw)
+        logger.info("Используем прокси для TG_USER_SESSION: %s", format_proxy_display(env_shared_proxy))
+    except ValueError as exc:
+        logger.warning("Не удалось разобрать TG_USER_PROXY. Параметр проигнорирован: %s", exc)
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
-bot["user_sender"] = user_sender
+bot["user_sender"] = None
 bot["personal_api_id"] = tg_user_api_id
 bot["personal_api_hash"] = tg_user_api_hash
 bot["personal_api_available"] = bool(tg_user_api_id and tg_user_api_hash)
+bot["personal_session"] = tg_user_session
+bot["shared_proxy"] = env_shared_proxy
+bot["shared_proxy_source"] = "env" if env_shared_proxy else None
 if bot["personal_api_available"] and tg_user_api_id and tg_user_api_hash:
     bot["account_manager"] = AccountManager(tg_user_api_id, tg_user_api_hash)
 else:
@@ -128,7 +242,7 @@ else:
 bot["audience_parser"] = AudienceParser(
     storage,
     base_dir=BASE_DIR,
-    user_sender=user_sender,
+    user_sender=None,
     account_manager=bot["account_manager"],
 )
 if bot["account_manager"]:
@@ -294,71 +408,6 @@ def format_account_display(account: Dict[str, Any]) -> str:
             return f"{title} ({phone})"
         return title
     return phone or "Аккаунт"
-
-
-SUPPORTED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
-PROXY_DISABLE_WORDS = {"off", "0", "none", "нет", "disable", "remove", "stop", "no"}
-
-
-def format_proxy_display(proxy: Dict[str, Any]) -> str:
-    proxy_type = (proxy.get("type") or "socks5").lower()
-    host = proxy.get("host") or "—"
-    port = proxy.get("port") or "—"
-    username = proxy.get("username") or ""
-    password = proxy.get("password") or ""
-    creds = ""
-    if username:
-        creds = username
-        if password:
-            creds += ":***"
-        creds += "@"
-    return f"{proxy_type}://{creds}{host}:{port}"
-
-
-def parse_proxy_string(raw: str) -> Dict[str, Any]:
-    if not raw:
-        raise ValueError("Укажите адрес прокси.")
-    text = raw.strip()
-    scheme = "socks5"
-    username: Optional[str] = None
-    password: Optional[str] = None
-    host: Optional[str] = None
-    port: Optional[int] = None
-    if "://" in text:
-        parsed = urlparse(text)
-        scheme = (parsed.scheme or "socks5").lower()
-        if scheme not in SUPPORTED_PROXY_SCHEMES:
-            raise ValueError("Поддерживаются только схемы socks5, socks4 и http.")
-        host = parsed.hostname
-        try:
-            port = parsed.port
-        except ValueError:
-            raise ValueError("Порт должен быть числом.")
-        username = parsed.username or None
-        password = parsed.password or None
-    else:
-        parts = [part.strip() for part in text.split(":")]
-        if len(parts) < 2:
-            raise ValueError("Укажите хост и порт через двоеточие.")
-        host = parts[0]
-        try:
-            port = int(parts[1])
-        except ValueError:
-            raise ValueError("Порт должен быть числом.")
-        if len(parts) >= 3 and parts[2]:
-            username = parts[2]
-        if len(parts) >= 4 and parts[3]:
-            password = parts[3]
-    if not host or port is None:
-        raise ValueError("Некорректный адрес прокси.")
-    return {
-        "type": scheme,
-        "host": host,
-        "port": port,
-        "username": username,
-        "password": password,
-    }
-
 
 def normalize_phone(raw: str) -> Optional[str]:
     digits = "".join(ch for ch in raw if ch.isdigit())
@@ -974,6 +1023,54 @@ async def handle_account_proxy_input(message: types.Message, state: FSMContext) 
         await message.answer("Прокси отключён. Трафик будет идти без обхода.")
     await state.finish()
     await show_account_menu(message, user_id=message.from_user.id)
+
+
+@dp.message_handler(state=SharedProxyStates.waiting_for_proxy, content_types=types.ContentTypes.TEXT)
+async def handle_shared_proxy_input(message: types.Message, state: FSMContext) -> None:
+    if await handle_possible_cancel(message, state):
+        return
+    if not await is_admin_user(message.from_user.id):
+        await message.reply("Настройка доступна только администраторам.")
+        await state.finish()
+        return
+    if message.bot.get("shared_proxy_source") == "env":
+        await message.reply("Текущий прокси задан через TG_USER_PROXY. Измените .env на сервере.")
+        await state.finish()
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply("Отправьте адрес прокси или off для отключения.")
+        return
+    lowered = text.lower()
+    proxy: Optional[Dict[str, Any]]
+    if lowered in PROXY_DISABLE_WORDS:
+        proxy = None
+    else:
+        try:
+            proxy = parse_proxy_string(text)
+        except ValueError as exc:
+            await message.reply(str(exc))
+            return
+    await storage.set_shared_proxy(proxy)
+    message.bot["shared_proxy"] = proxy
+    message.bot["shared_proxy_source"] = "db" if proxy else None
+    await state.finish()
+    sender = await replace_bot_user_sender(message.bot)
+    if proxy:
+        await message.answer(f"Прокси сохранён: {format_proxy_display(proxy)}")
+    else:
+        await message.answer("Прокси отключён. Теперь используется прямое подключение.")
+    session_value = message.bot.get("personal_session")
+    if not session_value:
+        await message.answer(
+            "Общий пользовательский аккаунт пока не активен: укажите TG_USER_SESSION в .env, чтобы его использовать."
+        )
+    elif sender is None:
+        await message.answer("Не удалось запустить общий пользовательский аккаунт. Проверьте TG_USER_SESSION.")
+    else:
+        identity = await sender.describe_self()
+        await message.answer(f"Общий аккаунт подключён: {identity}.")
+    await send_main_menu(message, user_id=message.from_user.id)
 
 
 async def finalize_account_login(message: types.Message, state: FSMContext, pending: PendingAccountLogin) -> None:
@@ -1629,6 +1726,32 @@ async def cb_main_settings(call: types.CallbackQuery) -> None:
     await call.message.edit_text(text, reply_markup=keyboard)
 
 
+@dp.callback_query_handler(lambda c: c.data == "main:shared_proxy", state="*")
+async def cb_main_shared_proxy(call: types.CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    await call.answer()
+    if call.bot.get("shared_proxy_source") == "env":
+        current = call.bot.get("shared_proxy")
+        status = format_proxy_display(current) if current else "не задан"
+        await call.message.answer(
+            "🌐 Общий прокси для MTProto задан через переменную окружения TG_USER_PROXY.\n"
+            f"Текущее значение: {status}.\n"
+            "Чтобы изменить его, обновите .env на сервере и перезапустите бота."
+        )
+        return
+    current = call.bot.get("shared_proxy")
+    status = format_proxy_display(current) if current else "не настроен"
+    await SharedProxyStates.waiting_for_proxy.set()
+    await call.message.answer(
+        "Отправьте параметры прокси одним сообщением.\n"
+        "Формат: socks5://login:pass@host:port или host:port[:login[:password]].\n"
+        "Команда off отключит прокси. Используйте /cancel для отмены.\n\n"
+        f"Текущее состояние: {status}."
+    )
+
+
 @dp.callback_query_handler(lambda c: c.data == "main:pay")
 async def cb_main_pay(call: types.CallbackQuery, state: FSMContext) -> None:
     await call.answer()
@@ -2266,18 +2389,14 @@ async def handle_group_text(message: types.Message) -> None:
 
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
-    user_sender_instance: Optional[UserSender] = dispatcher.bot.get("user_sender")
+    await sync_shared_proxy_from_storage(dispatcher.bot)
+    user_sender_instance = await replace_bot_user_sender(dispatcher.bot)
     if user_sender_instance:
         try:
-            await user_sender_instance.start()
             identity = await user_sender_instance.describe_self()
             logger.info("Пользовательская рассылка активирована от %s", identity)
         except Exception:
-            logger.exception(
-                "Не удалось подключить пользовательскую сессию. Будем отправлять сообщения от имени бота."
-            )
-            user_sender_instance = None
-            dispatcher.bot["user_sender"] = None
+            logger.exception("Не удалось определить пользователя для общей сессии.")
     account_manager: Optional[AccountManager] = dispatcher.bot.get("account_manager")
     auto_sender = AutoSender(
         dispatcher.bot,

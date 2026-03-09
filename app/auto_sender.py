@@ -72,6 +72,16 @@ class AutoSender:
         for user_id in list(self._tasks.keys()):
             await self.stop_user(user_id)
 
+    async def replace_user_sender(self, user_sender: Optional[UserSender]) -> None:
+        self._user_sender = user_sender
+        if user_sender is None:
+            self._personal_chats = {}
+        await self._storage.ensure_constraints(
+            user_id=None,
+            require_targets=self._user_sender is None,
+        )
+        await self.refresh_all()
+
     async def _deliver_message(
         self,
         user_id: int,

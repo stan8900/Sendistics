@@ -24,6 +24,7 @@ def main_menu_keyboard(is_admin: bool, *, allow_group_pick: bool) -> InlineKeybo
                 InlineKeyboardButton("👥 Парсер групп", callback_data="main:group_parser"),
                 InlineKeyboardButton("📨 Инвайтер", callback_data="main:inviter"),
             ],
+            [InlineKeyboardButton("🌐 Общий прокси", callback_data="main:shared_proxy")],
             [
                 InlineKeyboardButton("📜 Оплаты", callback_data="main:admin_payments"),
                 InlineKeyboardButton("🔁 Перепроверить оплату", callback_data="main:manual_payment"),
