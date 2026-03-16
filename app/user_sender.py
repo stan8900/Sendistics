@@ -33,6 +33,8 @@ class UserSender:
     async def start(self) -> None:
         async with self._start_lock:
             if self._started:
+                if not self._client.is_connected():
+                    await self._client.connect()
                 return
             await self._client.start()
             if not await self._client.is_user_authorized():
@@ -42,16 +44,14 @@ class UserSender:
             self._started = True
 
     async def send_message(self, chat_id: ChatId, message: str) -> None:
-        if not self._started:
-            await self.start()
+        await self.start()
         try:
             await self._client.send_message(chat_id, message)
         except RPCError as exc:
             raise RuntimeError(f"Не удалось отправить сообщение через пользовательский аккаунт: {exc}") from exc
 
     async def describe_self(self) -> str:
-        if not self._started:
-            await self.start()
+        await self.start()
         me = await self._client.get_me()
         if not me:
             return "неизвестный пользователь"
@@ -60,8 +60,7 @@ class UserSender:
         return f"{full_name} {username}" if username else full_name
 
     async def list_accessible_chats(self) -> List[Tuple[int, str]]:
-        if not self._started:
-            await self.start()
+        await self.start()
         chats: List[Tuple[int, str]] = []
         async for dialog in self._client.iter_dialogs():
             entity = dialog.entity
