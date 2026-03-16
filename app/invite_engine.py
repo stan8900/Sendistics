@@ -179,11 +179,20 @@ class InviteEngine:
         seen = set()
         with path.open("r", encoding="utf-8") as handler:
             for line in handler:
-                username = line.strip().split(",")[0].strip()
+                raw = line.strip()
+                if not raw:
+                    continue
+                if "," in raw:
+                    parts = [part.strip() for part in raw.split(",")]
+                    if len(parts) >= 2 and parts[0].lower() == "user_id" and parts[1].lower() == "username":
+                        continue
+                    username = parts[1] if len(parts) >= 2 and parts[1] else parts[0]
+                else:
+                    username = raw
+                username = username.lstrip("@").strip()
                 if not username:
                     continue
-                username = username.lstrip("@")
-                if not username or username.lower() in seen:
+                if username.lower() in seen:
                     continue
                 seen.add(username.lower())
                 usernames.append(username)
