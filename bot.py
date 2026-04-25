@@ -20,7 +20,14 @@ from app.account_manager import AccountManager, get_account_proxy
 from app.audience_parser import AudienceParser
 from app.auto_sender import AutoSender
 from app.invite_engine import InviteEngine
-from app.keyboards import GROUPS_PAGE_SIZE, accounts_keyboard, auto_menu_keyboard, groups_keyboard, main_menu_keyboard
+from app.keyboards import (
+    GROUPS_PAGE_SIZE,
+    accounts_keyboard,
+    auto_menu_keyboard,
+    groups_keyboard,
+    main_menu_keyboard,
+    my_account_keyboard,
+)
 from app.pdf_reports import build_payments_pdf
 from app.states import (
     AccountStates,
@@ -270,6 +277,7 @@ PAYMENT_THANK_YOU_MESSAGE = (
 WELCOME_TEXT_ADMIN = (
     "👋 Добро пожаловать обратно!\n\n"
     "⚒ Авторассылка — настройка сообщений и расписания\n"
+    "👤 Мой аккаунт — оплаты и номера для авторассылок\n"
     "💰 Пополнить баланс — контроль оплат пользователей\n"
     "📊 Статистика — просмотр результатов рассылки\n"
     "📋 Выбрать группы — управление чатами\n"
@@ -279,6 +287,7 @@ WELCOME_TEXT_ADMIN = (
 
 WELCOME_TEXT_USER = (
     "👋 Добро пожаловать!\n\n"
+    "👤 Мой аккаунт — оплаты и номера для авторассылок.\n"
     f"💰 Пополнить баланс — отправьте данные оплаты на карту {PAYMENT_CARD_TARGET}.\n"
     "📜 История оплат — проверьте статус заявок и срок подписки.\n\n"
     "Если вы оператор, используйте команду /admin и введите код доступа."
@@ -550,6 +559,42 @@ async def build_user_payment_history_text(user_id: int) -> str:
         card_number = payment.get("card_number")
         if card_number:
             lines.append(f"     Карта: {card_number}")
+    return "\n".join(lines)
+
+
+async def build_my_account_text(user_id: int) -> str:
+    payments = await storage.get_user_payments(user_id)
+    accounts = await storage.list_user_accounts(user_id)
+    auto = await storage.get_auto(user_id)
+    active_account_id = auto.get("sender_account_id")
+
+    approved_payment = next((payment for payment in payments if payment.get("status") == "approved"), None)
+    if approved_payment and approved_payment.get("resolved_at"):
+        try:
+            expires_dt = datetime.fromisoformat(approved_payment["resolved_at"]) + timedelta(days=PAYMENT_VALID_DAYS)
+            payment_status = f"активна до {expires_dt.strftime('%d.%m.%Y')} ✅"
+        except ValueError:
+            payment_status = "подтверждена ✅"
+    elif approved_payment:
+        payment_status = "подтверждена ✅"
+    elif any(payment.get("status") == "pending" for payment in payments):
+        payment_status = "ожидает подтверждения ⏳"
+    else:
+        payment_status = "не найдена"
+
+    lines = [
+        "👤 <b>Мой аккаунт</b>",
+        f"Оплата: {payment_status}",
+        f"Всего заявок на оплату: {len(payments)}",
+        "",
+        "📱 <b>Номера с авторассылками</b>",
+    ]
+    if accounts:
+        for account in accounts:
+            marker = "✅" if active_account_id is not None and int(account["id"]) == int(active_account_id) else "•"
+            lines.append(f"{marker} {format_account_display(account)}")
+    else:
+        lines.append("Номеров пока нет. Добавьте номер в разделе авторассылки.")
     return "\n".join(lines)
 
 
@@ -1749,6 +1794,16 @@ async def cb_main_shared_proxy(call: types.CallbackQuery, state: FSMContext) -> 
         "Формат: socks5://login:pass@host:port или host:port[:login[:password]].\n"
         "Команда off отключит прокси. Используйте /cancel для отмены.\n\n"
         f"Текущее состояние: {status}."
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "main:account")
+async def cb_main_account(call: types.CallbackQuery) -> None:
+    await call.answer()
+    text = await build_my_account_text(call.from_user.id)
+    await call.message.edit_text(
+        text,
+        reply_markup=my_account_keyboard(allow_account_pick=personal_api_ready(call.bot)),
     )
 
 
