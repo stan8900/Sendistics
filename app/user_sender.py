@@ -25,7 +25,15 @@ class UserSender:
         proxy: Optional[Dict[str, Union[str, int]]] = None,
     ) -> None:
         self._proxy = self._build_proxy(proxy)
-        self._client = TelegramClient(StringSession(session_string), api_id, api_hash, proxy=self._proxy)
+        self._client = TelegramClient(
+            StringSession(session_string),
+            api_id,
+            api_hash,
+            proxy=self._proxy,
+            connection_retries=2,
+            request_retries=2,
+            timeout=10,
+        )
         self._start_lock = asyncio.Lock()
         self._started = False
         self._logger = logging.getLogger(__name__)
