@@ -41,7 +41,7 @@ from app.states import (
     SharedProxyStates,
 )
 from app.storage import Storage
-from app.user_sender import UserSender
+from app.user_sender import UserSender, build_telethon_proxy
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
 PROXY_DISABLE_WORDS = {"off", "0", "none", "нет", "disable", "remove", "stop", "no"}
+SUPPORT_AGENT_USERNAME = "@rasylon_support"
 
 
 def format_proxy_display(proxy: Dict[str, Any]) -> str:
@@ -942,7 +943,16 @@ async def handle_account_phone(message: types.Message, state: FSMContext) -> Non
         await message.reply("Сервер не настроен для подключения номеров. Обратитесь к администратору.")
         await state.finish()
         return
-    client = TelegramClient(StringSession(), api_id, api_hash)
+    shared_proxy = message.bot.get("shared_proxy")
+    client = TelegramClient(
+        StringSession(),
+        api_id,
+        api_hash,
+        proxy=build_telethon_proxy(shared_proxy),
+        connection_retries=2,
+        request_retries=2,
+        timeout=10,
+    )
     try:
         await client.connect()
         sent = await client.send_code_request(normalized)
@@ -954,9 +964,15 @@ async def handle_account_phone(message: types.Message, state: FSMContext) -> Non
         await message.reply(f"Telegram попросил подождать {exc.seconds} секунд перед следующей попыткой.")
         await client.disconnect()
         return
-    except Exception:
+    except Exception as exc:
         logger.exception("Не удалось отправить код подтверждения на %s", normalized)
-        await message.reply("Не удалось отправить код. Попробуйте ещё раз чуть позже.")
+        if shared_proxy:
+            await message.reply(
+                "Не удалось отправить код через настроенный прокси. "
+                "Проверьте прокси в «🌐 Общий прокси» или временно отключите его."
+            )
+        else:
+            await message.reply(f"Не удалось отправить код: {exc}. Попробуйте ещё раз чуть позже.")
         await client.disconnect()
         return
     pending = PendingAccountLogin(
@@ -1184,6 +1200,11 @@ async def load_available_chats(
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
     await state.finish()
     await send_main_menu(message)
+
+
+@dp.message_handler(commands=["help"], state="*")
+async def cmd_help(message: types.Message) -> None:
+    await message.answer(f"Поддержка: {SUPPORT_AGENT_USERNAME}\nНаш ИИ-агент поможет с вопросами по боту.")
 
 
 @dp.message_handler(commands=["cancel"], state="*")
@@ -2444,6 +2465,13 @@ async def handle_group_text(message: types.Message) -> None:
 
 async def on_startup(dispatcher: Dispatcher) -> None:
     me = await dispatcher.bot.get_me()
+    await dispatcher.bot.set_my_commands(
+        [
+            types.BotCommand("start", "Открыть меню"),
+            types.BotCommand("help", "Поддержка"),
+            types.BotCommand("cancel", "Отменить текущий шаг"),
+        ]
+    )
     await sync_shared_proxy_from_storage(dispatcher.bot)
     user_sender_instance = await replace_bot_user_sender(dispatcher.bot)
     if user_sender_instance:

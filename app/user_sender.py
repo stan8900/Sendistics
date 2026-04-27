@@ -13,6 +13,29 @@ ChatId = Union[int, str]
 ProxyTuple = Tuple[int, str, int, bool, Optional[str], Optional[str]]
 
 
+def build_telethon_proxy(proxy: Optional[Dict[str, Union[str, int]]]) -> Optional[ProxyTuple]:
+    if not proxy:
+        return None
+    host = str(proxy.get("host") or "").strip()
+    port_raw = proxy.get("port")
+    if not host:
+        return None
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        return None
+    proxy_type = str(proxy.get("type") or "socks5").lower()
+    type_map = {
+        "socks5": socks.SOCKS5,
+        "socks4": socks.SOCKS4,
+        "http": socks.HTTP,
+    }
+    resolved_type = type_map.get(proxy_type, socks.SOCKS5)
+    username = proxy.get("username") if proxy.get("username") else None
+    password = proxy.get("password") if proxy.get("password") else None
+    return resolved_type, host, port, True, username, password
+
+
 class UserSender:
     """Wrapper around a Telethon client that sends messages from a user account."""
 
@@ -24,7 +47,7 @@ class UserSender:
         *,
         proxy: Optional[Dict[str, Union[str, int]]] = None,
     ) -> None:
-        self._proxy = self._build_proxy(proxy)
+        self._proxy = build_telethon_proxy(proxy)
         self._client = TelegramClient(
             StringSession(session_string),
             api_id,
@@ -89,25 +112,3 @@ class UserSender:
     @property
     def client(self) -> TelegramClient:
         return self._client
-
-    def _build_proxy(self, proxy: Optional[Dict[str, Union[str, int]]]) -> Optional[ProxyTuple]:
-        if not proxy:
-            return None
-        host = str(proxy.get("host") or "").strip()
-        port_raw = proxy.get("port")
-        if not host:
-            return None
-        try:
-            port = int(port_raw)
-        except (TypeError, ValueError):
-            return None
-        proxy_type = str(proxy.get("type") or "socks5").lower()
-        type_map = {
-            "socks5": socks.SOCKS5,
-            "socks4": socks.SOCKS4,
-            "http": socks.HTTP,
-        }
-        resolved_type = type_map.get(proxy_type, socks.SOCKS5)
-        username = proxy.get("username") if proxy.get("username") else None
-        password = proxy.get("password") if proxy.get("password") else None
-        return resolved_type, host, port, True, username, password
