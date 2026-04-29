@@ -19,7 +19,6 @@ from dotenv import load_dotenv
 from app.account_manager import AccountManager, get_account_proxy
 from app.audience_parser import AudienceParser
 from app.auto_sender import AutoSender
-from app.dashboard import start_dashboard
 from app.invite_engine import InviteEngine
 from app.keyboards import (
     GROUPS_PAGE_SIZE,
@@ -63,15 +62,6 @@ logger = logging.getLogger(__name__)
 SUPPORTED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
 PROXY_DISABLE_WORDS = {"off", "0", "none", "нет", "disable", "remove", "stop", "no"}
 SUPPORT_AGENT_USERNAME = "@rasylon_support"
-DASHBOARD_ENABLED = os.getenv("WEB_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-DASHBOARD_HOST = os.getenv("WEB_DASHBOARD_HOST", "0.0.0.0")
-try:
-    DASHBOARD_PORT = int(os.getenv("WEB_DASHBOARD_PORT", os.getenv("PORT", "8080")))
-except ValueError:
-    logger.warning("WEB_DASHBOARD_PORT должен быть числом. Используем 8080.")
-    DASHBOARD_PORT = 8080
-DASHBOARD_PASSWORD = os.getenv("WEB_DASHBOARD_PASSWORD") or os.getenv("ADMIN_CODE", "TW13")
-DASHBOARD_SECRET = os.getenv("WEB_DASHBOARD_SECRET") or os.getenv("BOT_TOKEN") or DASHBOARD_PASSWORD
 
 
 def format_proxy_display(proxy: Dict[str, Any]) -> str:
@@ -279,7 +269,6 @@ bot["audience_parser"] = AudienceParser(
     user_sender=None,
     account_manager=bot["account_manager"],
 )
-bot["dashboard_runner"] = None
 if bot["account_manager"]:
     bot["invite_engine"] = InviteEngine(storage, bot["account_manager"])
 else:
@@ -2577,18 +2566,6 @@ async def on_startup(dispatcher: Dispatcher) -> None:
         require_targets=dispatcher.bot.get("user_sender") is None,
     )
     await auto_sender.start_if_enabled()
-    if DASHBOARD_ENABLED:
-        dashboard_runner = await start_dashboard(
-            storage=storage,
-            password=DASHBOARD_PASSWORD,
-            secret=DASHBOARD_SECRET,
-            host=DASHBOARD_HOST,
-            port=DASHBOARD_PORT,
-            auto_sender_getter=lambda: dispatcher.bot.get("auto_sender"),
-            logger=logger,
-        )
-        dispatcher.bot["dashboard_runner"] = dashboard_runner
-        logger.info("Web dashboard запущен: http://%s:%s/dashboard", DASHBOARD_HOST, DASHBOARD_PORT)
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
 
 
@@ -2602,9 +2579,6 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     account_manager: Optional[AccountManager] = dispatcher.bot.get("account_manager")
     if account_manager:
         await account_manager.stop_all()
-    dashboard_runner = dispatcher.bot.get("dashboard_runner")
-    if dashboard_runner:
-        await dashboard_runner.cleanup()
     await dispatcher.storage.close()
     await dispatcher.storage.wait_closed()
 

@@ -35,12 +35,6 @@ DATABASE_URL_REQUIRED=false
 # необязательный список Telegram ID, которым всегда приходят уведомления об оплатах
 ADMIN_IDS=12345678,98765432
 ADMIN_CODE=TW13
-# опциональный веб-дэшборд для админов
-WEB_DASHBOARD_ENABLED=false
-WEB_DASHBOARD_HOST=0.0.0.0
-WEB_DASHBOARD_PORT=8080
-WEB_DASHBOARD_PASSWORD=сложный_пароль
-WEB_DASHBOARD_SECRET=случайная_строка_для_cookie
 # путь до SQLite-файла с данными (используется, если DATABASE_URL не задан)
    STORAGE_PATH=data/storage.db
    # опционально: данные персонального аккаунта, если рассылка должна идти от лица человека
@@ -151,29 +145,6 @@ WEB_DASHBOARD_SECRET=случайная_строка_для_cookie
    ```bash
    python bot.py
    ```
-
-### Веб-дэшборд
-
-Дэшборд запускается внутри процесса бота и использует ту же базу и тот же `AutoSender`, поэтому кнопки остановки работают сразу, а не только после следующего цикла.
-
-Чтобы включить:
-
-```env
-WEB_DASHBOARD_ENABLED=true
-WEB_DASHBOARD_HOST=0.0.0.0
-WEB_DASHBOARD_PORT=8080
-WEB_DASHBOARD_PASSWORD=сложный_пароль
-WEB_DASHBOARD_SECRET=случайная_строка_для_cookie
-```
-
-После запуска откройте `http://host:8080/dashboard`. Если `WEB_DASHBOARD_PASSWORD` не задан, используется `ADMIN_CODE`.
-
-В дэшборде доступны:
-
-- сводка активных рассылок, оплат и дневных отправок;
-- список авторассылок с ошибками, интервалом и дневным лимитом;
-- остановка одной рассылки или всех рассылок сразу;
-- последние заявки на оплату.
 
 ## Как пользоваться
 

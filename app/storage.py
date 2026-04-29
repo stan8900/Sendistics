@@ -204,19 +204,6 @@ class Storage:
             self._commit()
             return True, "reserved"
 
-    async def list_auto_daily_counts(self, day_key: str) -> Dict[int, int]:
-        async with self._lock:
-            rows = self._execute(
-                """
-                SELECT user_id, sent_count
-                FROM auto_daily_limits
-                WHERE day_key = ?
-                ORDER BY sent_count DESC
-                """,
-                (day_key,),
-            ).fetchall()
-            return {int(row["user_id"]): int(row["sent_count"] or 0) for row in rows}
-
     async def toggle_target_chat(
         self,
         user_id: int,
