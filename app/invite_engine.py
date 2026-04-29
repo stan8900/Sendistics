@@ -104,14 +104,23 @@ class InviteEngine:
                 except asyncio.QueueEmpty:
                     break
             finished_at = datetime.utcnow().isoformat()
-            status = "completed" if stats["invited"] and remaining == 0 else "failed"
+            if stats["invited"] > 0:
+                status = "completed"
+                last_error = (
+                    f"Осталось {remaining} пользователей: достигнут лимит аккаунтов за задачу."
+                    if remaining
+                    else None
+                )
+            else:
+                status = "failed"
+                last_error = "Не удалось пригласить пользователей"
             await self._storage.update_invite_job(
                 job_id,
                 status=status,
                 invited_count=stats["invited"],
                 failed_count=stats["failed"],
                 finished_at=finished_at,
-                last_error=None if status == "completed" else "Не удалось пригласить пользователей",
+                last_error=last_error,
             )
         finally:
             async with self._task_lock:

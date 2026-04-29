@@ -79,6 +79,22 @@ def format_proxy_display(proxy: Dict[str, Any]) -> str:
     return f"{proxy_type}://{creds}{host}:{port}"
 
 
+def build_shared_proxy_error_text(bot_obj: Bot) -> str:
+    proxy = bot_obj.get("shared_proxy")
+    source = bot_obj.get("shared_proxy_source")
+    status = format_proxy_display(proxy) if proxy else "не задан"
+    if source == "env":
+        action = "замените или удалите TG_USER_PROXY в переменных окружения Pella и перезапустите бота"
+    else:
+        action = "откройте «🌐 Общий прокси», замените прокси или отправьте off"
+    return (
+        "Не удалось подключиться к Telegram через общий прокси.\n"
+        f"Текущий прокси: {status}.\n"
+        f"Что сделать: {action}.\n\n"
+        "Пока прокси не отвечает, общий TG_USER_SESSION и добавление новых номеров через MTProto работать не будут."
+    )
+
+
 def parse_proxy_string(raw: str) -> Dict[str, Any]:
     if not raw:
         raise ValueError("Укажите адрес прокси.")
@@ -345,6 +361,15 @@ async def should_require_targets(bot_obj: Bot, user_id: int) -> bool:
         return False
     auto = await storage.get_auto(user_id)
     return not auto.get("sender_account_id")
+
+
+async def get_active_sender_account_id(user_id: int) -> Optional[int]:
+    auto = await storage.get_auto(user_id)
+    account_id = auto.get("sender_account_id")
+    if account_id is None:
+        return None
+    account = await storage.get_user_account(int(account_id), owner_id=user_id)
+    return int(account_id) if account else None
 
 
 async def replace_pending_account(user_id: int, pending: Optional[PendingAccountLogin]) -> None:
@@ -967,10 +992,7 @@ async def handle_account_phone(message: types.Message, state: FSMContext) -> Non
     except Exception as exc:
         logger.exception("Не удалось отправить код подтверждения на %s", normalized)
         if shared_proxy:
-            await message.reply(
-                "Не удалось отправить код через настроенный прокси. "
-                "Проверьте прокси в «🌐 Общий прокси» или временно отключите его."
-            )
+            await message.reply(build_shared_proxy_error_text(message.bot))
         else:
             await message.reply(f"Не удалось отправить код: {exc}. Попробуйте ещё раз чуть позже.")
         await client.disconnect()
@@ -1382,6 +1404,7 @@ async def parser_wait_limit(message: types.Message, state: FSMContext) -> None:
             message.from_user.id,
             source=source,
             limit=limit,
+            account_id=await get_active_sender_account_id(message.from_user.id),
         )
     except Exception as exc:  # pragma: no cover - network operations
         logger.exception("Не удалось выполнить парсинг %s для %s", source, message.from_user.id)
@@ -1455,6 +1478,7 @@ async def group_parser_wait_choice(message: types.Message, state: FSMContext) ->
         dump = await parser.parse_group_members(
             message.from_user.id,
             group=target,
+            account_id=await get_active_sender_account_id(message.from_user.id),
         )
     except Exception as exc:  # pragma: no cover - network work
         logger.exception("Не удалось выполнить групповой парсинг %s", target)
@@ -1618,7 +1642,10 @@ async def cb_main_group_parser(call: types.CallbackQuery, state: FSMContext) -> 
         await call.answer("Парсер недоступен. Добавьте личный API или аккаунт.", show_alert=True)
         return
     try:
-        groups = await parser.list_personal_groups(call.from_user.id)
+        groups = await parser.list_personal_groups(
+            call.from_user.id,
+            account_id=await get_active_sender_account_id(call.from_user.id),
+        )
     except Exception as exc:  # pragma: no cover - network
         logger.exception("Не удалось получить список групп для парсинга.")
         await call.answer(f"Ошибка подключения к аккаунту: {exc}", show_alert=True)
@@ -2353,7 +2380,30 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
         await call.message.answer("Сначала задайте текст сообщения.")
         return
     selected_targets = auto.get("target_chat_ids") or []
-    if call.bot.get("user_sender"):
+    selected_account_id = auto.get("sender_account_id")
+    if selected_account_id is not None:
+        known = await storage.list_known_chats(account_id=selected_account_id, owner_id=call.from_user.id)
+        if not known:
+            refreshed = await refresh_account_chats(call.bot, call.from_user.id, int(selected_account_id))
+            if refreshed:
+                known = await storage.list_known_chats(account_id=selected_account_id, owner_id=call.from_user.id)
+        if not known:
+            await call.message.answer(
+                "У выбранного номера нет сохранённых групп. Нажмите «📱 Номер» → «🔄 Обновить чаты» "
+                "или добавьте аккаунт в рабочие группы."
+            )
+            return
+        available_ids = {int(chat_id) for chat_id in known.keys()}
+        if selected_targets:
+            valid_targets = [chat_id for chat_id in selected_targets if chat_id in available_ids]
+            if not valid_targets:
+                await call.message.answer(
+                    "Выбранные группы недоступны для этого номера. Обновите список чатов и выберите группы заново."
+                )
+                return
+        else:
+            selected_targets = list(available_ids)
+    elif call.bot.get("user_sender"):
         auto_sender: AutoSender = call.bot["auto_sender"]
         personal_chats = await auto_sender.get_personal_chats(refresh=True)
         if not personal_chats:

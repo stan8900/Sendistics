@@ -86,6 +86,38 @@ class StorageExtensionsTest(unittest.TestCase):
 
         asyncio.run(runner())
 
+    def test_account_specific_targets_are_separate_from_bot_targets(self) -> None:
+        async def runner() -> None:
+            await self.storage.upsert_known_chat(-1001, "Bot group")
+            account = await self.storage.create_user_account(
+                42,
+                phone="+10000000000",
+                session="session-string",
+                title="Personal",
+                username="personal",
+            )
+            account_id = int(account["id"])
+            await self.storage.replace_account_chats(
+                account_id,
+                [(-2001, "Personal group"), (-2002, "Second personal group")],
+            )
+
+            await self.storage.set_target_chats(42, [-1001])
+            bot_auto = await self.storage.get_auto(42)
+            self.assertEqual(bot_auto["target_chat_ids"], [-1001])
+
+            await self.storage.set_user_sender_account(42, account_id)
+            await self.storage.set_target_chats(42, [-2002], account_id=account_id)
+            account_auto = await self.storage.get_auto(42)
+            self.assertEqual(account_auto["sender_account_id"], account_id)
+            self.assertEqual(account_auto["target_chat_ids"], [-2002])
+
+            await self.storage.set_user_sender_account(42, None)
+            bot_auto_again = await self.storage.get_auto(42)
+            self.assertEqual(bot_auto_again["target_chat_ids"], [-1001])
+
+        asyncio.run(runner())
+
 
 if __name__ == "__main__":
     unittest.main()
