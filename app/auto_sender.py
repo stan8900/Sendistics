@@ -1,6 +1,8 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
@@ -8,6 +10,14 @@ from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
 from .account_manager import AccountManager
 from .storage import Storage
 from .user_sender import UserSender
+
+
+TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
+AUTO_WORK_START_HOUR = 8
+AUTO_WORK_END_HOUR = 20
+AUTO_DAILY_MESSAGE_LIMIT = 50
+AUTO_CHAT_MIN_INTERVAL_SECONDS = 60
+AUTO_SEND_PACE_SECONDS = 60
 
 
 class AutoSender:
@@ -132,11 +142,53 @@ class AutoSender:
                     await self._storage.set_auto_enabled(user_id, False)
                     break
 
+                wait_until_work_window = self._seconds_until_work_window()
+                if wait_until_work_window is not None:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=wait_until_work_window)
+                        stop_event.clear()
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+
                 account_id = auto.get("sender_account_id")
                 success = 0
                 errors: List[str] = []
-                for chat_id in targets:
+                for index, chat_id in enumerate(targets):
                     try:
+                        if index > 0:
+                            try:
+                                await asyncio.wait_for(stop_event.wait(), timeout=AUTO_SEND_PACE_SECONDS)
+                                stop_event.clear()
+                                break
+                            except asyncio.TimeoutError:
+                                pass
+                        wait_until_work_window = self._seconds_until_work_window()
+                        if wait_until_work_window is not None:
+                            try:
+                                await asyncio.wait_for(stop_event.wait(), timeout=wait_until_work_window)
+                                stop_event.clear()
+                                break
+                            except asyncio.TimeoutError:
+                                continue
+                        now = self._now_tashkent()
+                        reserved, reason = await self._storage.reserve_auto_delivery(
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            day_key=now.date().isoformat(),
+                            now_iso=now.isoformat(),
+                            daily_limit=AUTO_DAILY_MESSAGE_LIMIT,
+                            chat_interval_seconds=AUTO_CHAT_MIN_INTERVAL_SECONDS,
+                        )
+                        if not reserved:
+                            if reason == "daily_limit":
+                                errors.append(
+                                    f"Дневной лимит {AUTO_DAILY_MESSAGE_LIMIT} сообщений исчерпан."
+                                )
+                                break
+                            if reason == "chat_rate_limit":
+                                errors.append(f"Чат {chat_id}: лимит 1 сообщение в минуту.")
+                                continue
                         await self._deliver_message(user_id, chat_id, message, account_id)
                         success += 1
                     except (BotKicked, ChatNotFound, Unauthorized) as exc:
@@ -165,6 +217,21 @@ class AutoSender:
         )
         global_payment = await self._storage.has_recent_payment(within_days=self._payment_valid_days)
         return user_payment and global_payment
+
+    def _now_tashkent(self) -> datetime:
+        return datetime.now(TASHKENT_TZ)
+
+    def _seconds_until_work_window(self) -> Optional[float]:
+        now = self._now_tashkent()
+        start = now.replace(hour=AUTO_WORK_START_HOUR, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=AUTO_WORK_END_HOUR, minute=0, second=0, microsecond=0)
+        if start <= now < end:
+            return None
+        if now < start:
+            next_start = start
+        else:
+            next_start = start + timedelta(days=1)
+        return max(1.0, (next_start - now).total_seconds())
 
     async def get_personal_chats(self, *, refresh: bool = False) -> Dict[int, str]:
         if not self._user_sender:

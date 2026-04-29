@@ -142,6 +142,68 @@ class Storage:
             self._commit()
             return disabled_count
 
+    async def reserve_auto_delivery(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        day_key: str,
+        now_iso: str,
+        daily_limit: int,
+        chat_interval_seconds: int,
+    ) -> Tuple[bool, str]:
+        async with self._lock:
+            daily_row = self._execute(
+                """
+                SELECT sent_count
+                FROM auto_daily_limits
+                WHERE user_id = ? AND day_key = ?
+                """,
+                (user_id, day_key),
+            ).fetchone()
+            sent_count = int(daily_row["sent_count"] or 0) if daily_row else 0
+            if sent_count >= daily_limit:
+                return False, "daily_limit"
+
+            chat_row = self._execute(
+                """
+                SELECT last_sent_at
+                FROM auto_chat_rate_limits
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+            if chat_row and chat_row["last_sent_at"]:
+                try:
+                    last_sent_at = datetime.fromisoformat(chat_row["last_sent_at"])
+                    now_dt = datetime.fromisoformat(now_iso)
+                    elapsed = (now_dt - last_sent_at).total_seconds()
+                except (TypeError, ValueError):
+                    elapsed = chat_interval_seconds
+                if elapsed < chat_interval_seconds:
+                    return False, "chat_rate_limit"
+
+            self._execute(
+                """
+                INSERT INTO auto_daily_limits (user_id, day_key, sent_count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(user_id, day_key) DO UPDATE SET
+                    sent_count = auto_daily_limits.sent_count + 1
+                """,
+                (user_id, day_key),
+            )
+            self._execute(
+                """
+                INSERT INTO auto_chat_rate_limits (chat_id, last_sent_at)
+                VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (chat_id, now_iso),
+            )
+            self._commit()
+            return True, "reserved"
+
     async def toggle_target_chat(
         self,
         user_id: int,
@@ -1210,6 +1272,24 @@ class Storage:
                 sent_total INTEGER NOT NULL DEFAULT 0,
                 last_sent_at TEXT,
                 last_error TEXT
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_daily_limits (
+                user_id BIGINT NOT NULL,
+                day_key TEXT NOT NULL,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, day_key)
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_chat_rate_limits (
+                chat_id BIGINT PRIMARY KEY,
+                last_sent_at TEXT NOT NULL
             )
             """
         )

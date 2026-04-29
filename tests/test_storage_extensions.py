@@ -135,6 +135,53 @@ class StorageExtensionsTest(unittest.TestCase):
 
         asyncio.run(runner())
 
+    def test_auto_delivery_reservation_limits_daily_and_per_chat_rate(self) -> None:
+        async def runner() -> None:
+            first_reserved, first_reason = await self.storage.reserve_auto_delivery(
+                user_id=1,
+                chat_id=-100,
+                day_key="2026-04-29",
+                now_iso="2026-04-29T08:00:00+05:00",
+                daily_limit=2,
+                chat_interval_seconds=60,
+            )
+            self.assertTrue(first_reserved)
+            self.assertEqual(first_reason, "reserved")
+
+            second_reserved, second_reason = await self.storage.reserve_auto_delivery(
+                user_id=2,
+                chat_id=-100,
+                day_key="2026-04-29",
+                now_iso="2026-04-29T08:00:30+05:00",
+                daily_limit=2,
+                chat_interval_seconds=60,
+            )
+            self.assertFalse(second_reserved)
+            self.assertEqual(second_reason, "chat_rate_limit")
+
+            third_reserved, _ = await self.storage.reserve_auto_delivery(
+                user_id=1,
+                chat_id=-101,
+                day_key="2026-04-29",
+                now_iso="2026-04-29T08:01:01+05:00",
+                daily_limit=2,
+                chat_interval_seconds=60,
+            )
+            self.assertTrue(third_reserved)
+
+            fourth_reserved, fourth_reason = await self.storage.reserve_auto_delivery(
+                user_id=1,
+                chat_id=-102,
+                day_key="2026-04-29",
+                now_iso="2026-04-29T08:02:01+05:00",
+                daily_limit=2,
+                chat_interval_seconds=60,
+            )
+            self.assertFalse(fourth_reserved)
+            self.assertEqual(fourth_reason, "daily_limit")
+
+        asyncio.run(runner())
+
 
 if __name__ == "__main__":
     unittest.main()
