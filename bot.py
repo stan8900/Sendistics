@@ -1324,6 +1324,24 @@ async def cmd_list_jobs(message: types.Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
+@dp.message_handler(commands=["stop_all_mailings", "стоп_рассылки"], state="*")
+async def cmd_stop_all_mailings(message: types.Message, state: FSMContext) -> None:
+    await state.finish()
+    if not await is_admin_user(message.from_user.id):
+        await message.answer("Команда доступна только администраторам.")
+        return
+    disabled_count = await storage.disable_all_auto()
+    auto_sender: Optional[AutoSender] = message.bot.get("auto_sender")
+    if auto_sender:
+        await auto_sender.stop_all()
+    await message.answer(
+        "Все авторассылки остановлены."
+        if disabled_count
+        else "Активных авторассылок не было."
+    )
+    await send_main_menu(message)
+
+
 @dp.message_handler(commands=["админ"], state="*")
 async def cmd_admin_login_ru(message: types.Message, state: FSMContext) -> None:
     await cmd_admin_login(message, state)
@@ -2520,6 +2538,7 @@ async def on_startup(dispatcher: Dispatcher) -> None:
             types.BotCommand("start", "Открыть меню"),
             types.BotCommand("help", "Поддержка"),
             types.BotCommand("cancel", "Отменить текущий шаг"),
+            types.BotCommand("stop_all_mailings", "Остановить все авторассылки"),
         ]
     )
     await sync_shared_proxy_from_storage(dispatcher.bot)

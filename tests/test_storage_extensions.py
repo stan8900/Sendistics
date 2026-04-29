@@ -118,6 +118,23 @@ class StorageExtensionsTest(unittest.TestCase):
 
         asyncio.run(runner())
 
+    def test_disable_all_auto_turns_off_every_user(self) -> None:
+        async def runner() -> None:
+            await self.storage.set_auto_message(1, "first")
+            await self.storage.set_auto_interval(1, 10)
+            await self.storage.set_auto_enabled(1, True)
+            await self.storage.set_auto_message(2, "second")
+            await self.storage.set_auto_interval(2, 20)
+            await self.storage.set_auto_enabled(2, True)
+
+            disabled_count = await self.storage.disable_all_auto()
+
+            self.assertEqual(disabled_count, 2)
+            self.assertFalse((await self.storage.get_auto(1))["is_enabled"])
+            self.assertFalse((await self.storage.get_auto(2))["is_enabled"])
+
+        asyncio.run(runner())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -131,6 +131,17 @@ class Storage:
             )
             self._commit()
 
+    async def disable_all_auto(self) -> int:
+        async with self._lock:
+            row = self._execute(
+                "SELECT COUNT(*) AS cnt FROM user_auto_configs WHERE is_enabled = 1"
+            ).fetchone()
+            disabled_count = int(row["cnt"] or 0) if row else 0
+            self._execute("UPDATE user_auto_configs SET is_enabled = 0 WHERE is_enabled = 1")
+            self._execute("UPDATE auto_config SET is_enabled = 0 WHERE id = 1")
+            self._commit()
+            return disabled_count
+
     async def toggle_target_chat(
         self,
         user_id: int,
