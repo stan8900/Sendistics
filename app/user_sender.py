@@ -85,7 +85,7 @@ class UserSender:
                         ) from exc
                 return
             try:
-                await self._client.start()
+                await self._client.connect()
                 if not await self._client.is_user_authorized():
                     await self._mark_invalid()
                     raise InvalidUserSessionError(

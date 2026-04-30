@@ -1,8 +1,10 @@
 import asyncio
+import os
 import unittest
+from datetime import datetime, timezone
 
 from app.auto_sender import AutoSender
-from app.user_sender import InvalidUserSessionError
+from app.user_sender import InvalidUserSessionError, UserSender
 
 
 class FakeBot(dict):
@@ -40,7 +42,70 @@ class RevokedSender:
         self.stopped = True
 
 
+class UnauthorizedClient:
+    def __init__(self) -> None:
+        self.connected = False
+        self.disconnected = False
+        self.start_called = False
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def start(self) -> None:
+        self.start_called = True
+        raise AssertionError("Telethon interactive start should not be called")
+
+    async def is_user_authorized(self) -> bool:
+        return False
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+        self.connected = False
+
+
 class InvalidSessionTest(unittest.TestCase):
+    def test_user_sender_does_not_prompt_for_unauthorized_session(self) -> None:
+        async def runner() -> None:
+            sender = UserSender(12345, "hash", "")
+            client = UnauthorizedClient()
+            sender._client = client
+
+            with self.assertRaises(InvalidUserSessionError):
+                await sender.start()
+
+            self.assertFalse(client.start_called)
+            self.assertTrue(client.disconnected)
+
+        asyncio.run(runner())
+
+    def test_sleep_mode_uses_tashkent_timezone(self) -> None:
+        os.environ.setdefault("BOT_TOKEN", "123:abc")
+        import bot
+
+        original_until = bot.BOT_SLEEP_UNTIL_RAW
+        original_from = bot.BOT_SLEEP_FROM_RAW
+        original_to = bot.BOT_SLEEP_TO_RAW
+        original_timezone = bot.BOT_SLEEP_TIMEZONE_RAW
+        try:
+            bot.BOT_SLEEP_UNTIL_RAW = None
+            bot.BOT_SLEEP_FROM_RAW = "00:00"
+            bot.BOT_SLEEP_TO_RAW = "09:00"
+            bot.BOT_SLEEP_TIMEZONE_RAW = "Asia/Tashkent"
+
+            sleep_until = bot.get_active_sleep_until(datetime(2026, 4, 30, 19, 13, tzinfo=timezone.utc))
+
+            self.assertIsNotNone(sleep_until)
+            self.assertEqual(sleep_until.strftime("%Y-%m-%d %H:%M %z"), "2026-05-01 09:00 +0500")
+            self.assertEqual(bot.build_sleep_message(sleep_until), "Бот находится в режиме спячки до 01.05.2026 09:00. Напишите позже.")
+        finally:
+            bot.BOT_SLEEP_UNTIL_RAW = original_until
+            bot.BOT_SLEEP_FROM_RAW = original_from
+            bot.BOT_SLEEP_TO_RAW = original_to
+            bot.BOT_SLEEP_TIMEZONE_RAW = original_timezone
+
     def test_refresh_personal_chats_disables_revoked_shared_sender(self) -> None:
         async def runner() -> None:
             sender = RevokedSender()

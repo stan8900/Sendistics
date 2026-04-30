@@ -3,14 +3,17 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.handler import CancelHandler
+from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.utils import exceptions, executor
 from aiogram.utils.markdown import hbold, quote_html
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -62,6 +65,116 @@ logger = logging.getLogger(__name__)
 SUPPORTED_PROXY_SCHEMES = {"socks5", "socks4", "http"}
 PROXY_DISABLE_WORDS = {"off", "0", "none", "нет", "disable", "remove", "stop", "no"}
 SUPPORT_AGENT_USERNAME = "@rasylon_support"
+BOT_SLEEP_UNTIL_RAW = os.getenv("BOT_SLEEP_UNTIL") or os.getenv("SLEEP_UNTIL")
+BOT_SLEEP_FROM_RAW = os.getenv("BOT_SLEEP_FROM", "00:00")
+BOT_SLEEP_TO_RAW = os.getenv("BOT_SLEEP_TO", "09:00")
+BOT_SLEEP_TIMEZONE_RAW = os.getenv("BOT_SLEEP_TIMEZONE", "Asia/Tashkent")
+BOT_SLEEP_MESSAGE_TEMPLATE = os.getenv(
+    "BOT_SLEEP_MESSAGE",
+    "Бот находится в режиме спячки до {until}. Напишите позже.",
+)
+
+
+def get_sleep_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(BOT_SLEEP_TIMEZONE_RAW)
+    except ZoneInfoNotFoundError:
+        logger.warning("Неизвестный BOT_SLEEP_TIMEZONE=%s. Используем Asia/Tashkent.", BOT_SLEEP_TIMEZONE_RAW)
+        return ZoneInfo("Asia/Tashkent")
+
+
+def parse_sleep_until(raw: Optional[str], now: Optional[datetime] = None) -> Optional[datetime]:
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    timezone = get_sleep_timezone()
+    now = now or datetime.now(timezone)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone)
+    else:
+        now = now.astimezone(timezone)
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone)
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone)
+        return parsed.astimezone(timezone)
+    except ValueError:
+        pass
+    try:
+        parsed_time = datetime.strptime(text, "%H:%M").time()
+    except ValueError:
+        logger.warning("BOT_SLEEP_UNTIL должен быть в формате HH:MM, YYYY-MM-DD HH:MM или DD.MM.YYYY HH:MM.")
+        return None
+    return datetime.combine(now.date(), parsed_time, tzinfo=timezone)
+
+
+def parse_sleep_time(raw: Optional[str]) -> Optional[datetime_time]:
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M").time()
+    except ValueError:
+        logger.warning("Время режима спячки должно быть в формате HH:MM.")
+        return None
+
+
+def get_active_sleep_until(now: Optional[datetime] = None) -> Optional[datetime]:
+    timezone = get_sleep_timezone()
+    now = now or datetime.now(timezone)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone)
+    else:
+        now = now.astimezone(timezone)
+    sleep_until = parse_sleep_until(BOT_SLEEP_UNTIL_RAW, now=now)
+    if sleep_until and sleep_until > now:
+        return sleep_until
+
+    sleep_from = parse_sleep_time(BOT_SLEEP_FROM_RAW)
+    sleep_to = parse_sleep_time(BOT_SLEEP_TO_RAW)
+    if not sleep_from or not sleep_to or sleep_from == sleep_to:
+        return None
+    now_time = now.time()
+    if sleep_from < sleep_to:
+        if sleep_from <= now_time < sleep_to:
+            return datetime.combine(now.date(), sleep_to, tzinfo=timezone)
+        return None
+    if now_time >= sleep_from:
+        return datetime.combine(now.date() + timedelta(days=1), sleep_to, tzinfo=timezone)
+    if now_time < sleep_to:
+        return datetime.combine(now.date(), sleep_to, tzinfo=timezone)
+    return None
+
+
+def build_sleep_message(sleep_until: datetime) -> str:
+    until_text = sleep_until.astimezone(get_sleep_timezone()).strftime("%d.%m.%Y %H:%M")
+    try:
+        return BOT_SLEEP_MESSAGE_TEMPLATE.format(until=until_text)
+    except (KeyError, ValueError):
+        logger.warning("BOT_SLEEP_MESSAGE содержит некорректный шаблон. Используем стандартный текст.")
+        return f"Бот находится в режиме спячки до {until_text}. Напишите позже."
+
+
+async def answer_sleep_message_if_needed(message: types.Message) -> bool:
+    if message.chat.type != types.ChatType.PRIVATE:
+        return False
+    sleep_until = get_active_sleep_until()
+    if not sleep_until:
+        return False
+    await message.answer(build_sleep_message(sleep_until))
+    return True
+
+
+class SleepModeMiddleware(BaseMiddleware):
+    async def on_pre_process_message(self, message: types.Message, data: Dict[str, Any]) -> None:
+        if await answer_sleep_message_if_needed(message):
+            raise CancelHandler()
 
 
 def format_proxy_display(proxy: Dict[str, Any]) -> str:
@@ -249,6 +362,7 @@ if tg_user_proxy_raw:
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
+dp.middleware.setup(SleepModeMiddleware())
 
 bot["storage"] = storage
 bot["auto_sender"] = None  # filled on startup
@@ -1220,12 +1334,16 @@ async def load_available_chats(
 
 @dp.message_handler(commands=["start", "menu"], state="*")
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
+    if await answer_sleep_message_if_needed(message):
+        return
     await state.finish()
     await send_main_menu(message)
 
 
 @dp.message_handler(commands=["help"], state="*")
 async def cmd_help(message: types.Message) -> None:
+    if await answer_sleep_message_if_needed(message):
+        return
     await message.answer(f"Поддержка: {SUPPORT_AGENT_USERNAME}\nНаш ИИ-агент поможет с вопросами по боту.")
 
 
@@ -2485,6 +2603,8 @@ async def cb_auto_stop(call: types.CallbackQuery) -> None:
     state="*",
 )
 async def handle_private_message_without_command(message: types.Message, state: FSMContext) -> None:
+    if await answer_sleep_message_if_needed(message):
+        return
     if await state.get_state():
         return
     await send_main_menu(message)
