@@ -9,7 +9,7 @@ from aiogram.utils.exceptions import BotKicked, ChatNotFound, Unauthorized
 
 from .account_manager import AccountManager
 from .storage import Storage
-from .user_sender import UserSender
+from .user_sender import InvalidUserSessionError, UserSender
 
 
 TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
@@ -108,11 +108,19 @@ class AutoSender:
             session = account.get("session")
             if not session:
                 raise RuntimeError("У аккаунта отсутствует активная сессия.")
-            sender = await self._account_manager.get_sender(account)
-            await sender.send_message(chat_id, message)
+            try:
+                sender = await self._account_manager.get_sender(account)
+                await sender.send_message(chat_id, message)
+            except InvalidUserSessionError:
+                await self._account_manager.drop_sender(account_id)
+                raise
             return
         if self._user_sender:
-            await self._user_sender.send_message(chat_id, message)
+            try:
+                await self._user_sender.send_message(chat_id, message)
+            except InvalidUserSessionError:
+                await self._disable_shared_user_sender()
+                raise
             return
         await self._bot.send_message(chat_id, message)
 
@@ -154,6 +162,7 @@ class AutoSender:
                 account_id = auto.get("sender_account_id")
                 success = 0
                 errors: List[str] = []
+                should_stop = False
                 for index, chat_id in enumerate(targets):
                     try:
                         if index > 0:
@@ -193,9 +202,16 @@ class AutoSender:
                         success += 1
                     except (BotKicked, ChatNotFound, Unauthorized) as exc:
                         errors.append(f"Недоступен чат {chat_id}: {exc}")
+                    except InvalidUserSessionError as exc:
+                        errors.append(f"Личный аккаунт Telegram недоступен: {exc}")
+                        await self._storage.set_auto_enabled(user_id, False)
+                        should_stop = True
+                        break
                     except Exception as exc:  # pragma: no cover - network errors
                         errors.append(f"Ошибка доставки в чат {chat_id}: {exc}")
                 await self._storage.update_stats(user_id, sent=success, errors=errors)
+                if should_stop:
+                    break
 
                 wait_for = max(1, interval * 60)
                 try:
@@ -246,6 +262,10 @@ class AutoSender:
             return
         try:
             dialogs = await self._user_sender.list_accessible_chats()
+        except InvalidUserSessionError as exc:
+            self._logger.error("Общая пользовательская сессия Telegram недоступна: %s", exc)
+            await self._disable_shared_user_sender()
+            return
         except Exception:
             self._logger.exception("Не удалось получить список групп личного аккаунта.")
             return
@@ -276,3 +296,18 @@ class AutoSender:
                 return [chat_id for chat_id in selected if chat_id in available_ids]
             return list(personal_chats.keys())
         return list(auto.get("target_chat_ids") or [])
+
+    async def _disable_shared_user_sender(self) -> None:
+        sender = self._user_sender
+        self._user_sender = None
+        self._personal_chats = {}
+        self._bot["user_sender"] = None
+        audience_parser = self._bot.get("audience_parser")
+        if audience_parser:
+            audience_parser.set_user_sender(None)
+        if sender:
+            try:
+                await sender.stop()
+            except Exception:
+                self._logger.exception("Не удалось остановить невалидную пользовательскую сессию.")
+        await self._storage.ensure_constraints(user_id=None, require_targets=True)

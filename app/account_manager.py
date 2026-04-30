@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .user_sender import UserSender
+from .user_sender import InvalidUserSessionError, UserSender
 
 
 def get_account_proxy(account: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -68,7 +68,14 @@ class AccountManager:
                 sender = UserSender(self._api_id, self._api_hash, session_string, proxy=proxy)
                 self._senders[account_id] = sender
                 self._configs[account_id] = desired_signature
-        await sender.start()
+        try:
+            await sender.start()
+        except InvalidUserSessionError:
+            async with self._lock:
+                if self._senders.get(account_id) is sender:
+                    self._senders.pop(account_id, None)
+                    self._configs.pop(account_id, None)
+            raise
         return sender
 
     async def drop_sender(self, account_id: int) -> None:
