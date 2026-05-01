@@ -164,6 +164,8 @@ def build_sleep_message(sleep_until: datetime) -> str:
 async def answer_sleep_message_if_needed(message: types.Message) -> bool:
     if message.chat.type != types.ChatType.PRIVATE:
         return False
+    if message.from_user and await is_admin_user(message.from_user.id):
+        return False
     sleep_until = get_active_sleep_until()
     if not sleep_until:
         return False
