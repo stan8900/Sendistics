@@ -219,13 +219,19 @@ async def health(request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
-    password = os.getenv("ADMIN_WEB_PASSWORD") or os.getenv("ADMIN_CODE")
+    password = (
+        os.getenv("ADMIN_WEB_PASSWORD")
+        or os.getenv("WEB_DASHBOARD_PASSWORD")
+        or os.getenv("ADMIN_CODE")
+    )
     if not password:
-        raise RuntimeError("Set ADMIN_WEB_PASSWORD or ADMIN_CODE to protect the web admin panel.")
+        raise RuntimeError(
+            "Set ADMIN_WEB_PASSWORD, WEB_DASHBOARD_PASSWORD, or ADMIN_CODE to protect the web admin panel."
+        )
     app = web.Application()
     app["storage"] = create_storage_from_env()
     app["admin_password"] = password
-    app["session_token"] = secrets.token_urlsafe(32)
+    app["session_token"] = os.getenv("WEB_DASHBOARD_SECRET") or secrets.token_urlsafe(32)
     app.router.add_get("/health", health)
     app.router.add_get("/login", login_page)
     app.router.add_post("/api/login", login_api)
@@ -505,5 +511,5 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", os.getenv("ADMIN_WEB_PORT", "8080")))
-    host = os.getenv("ADMIN_WEB_HOST", "0.0.0.0")
+    host = os.getenv("ADMIN_WEB_HOST", os.getenv("WEB_DASHBOARD_HOST", "0.0.0.0"))
     web.run_app(create_app(), host=host, port=port)
