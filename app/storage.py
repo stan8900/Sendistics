@@ -204,6 +204,107 @@ class Storage:
             self._commit()
             return True, "reserved"
 
+    async def record_auto_campaign_start(
+        self,
+        user_id: int,
+        *,
+        started_at: Optional[str] = None,
+    ) -> None:
+        async with self._lock:
+            self._execute(
+                """
+                INSERT INTO auto_campaign_events (id, user_id, started_at)
+                VALUES (?, ?, ?)
+                """,
+                (uuid4().hex, user_id, started_at or datetime.utcnow().isoformat()),
+            )
+            self._commit()
+
+    async def count_auto_campaign_starts(self, *, since: Optional[datetime] = None) -> int:
+        async with self._lock:
+            if since is None:
+                row = self._execute(
+                    "SELECT COUNT(*) AS cnt FROM auto_campaign_events"
+                ).fetchone()
+            else:
+                row = self._execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM auto_campaign_events
+                    WHERE started_at >= ?
+                    """,
+                    (since.isoformat(),),
+                ).fetchone()
+            return int(row["cnt"] or 0) if row else 0
+
+    async def count_auto_deliveries(self, *, since: Optional[datetime] = None) -> int:
+        async with self._lock:
+            if since is None:
+                row = self._execute(
+                    "SELECT COALESCE(SUM(sent_count), 0) AS cnt FROM auto_delivery_events"
+                ).fetchone()
+            else:
+                row = self._execute(
+                    """
+                    SELECT COALESCE(SUM(sent_count), 0) AS cnt
+                    FROM auto_delivery_events
+                    WHERE delivered_at >= ?
+                    """,
+                    (since.isoformat(),),
+                ).fetchone()
+            return int(row["cnt"] or 0) if row else 0
+
+    async def count_active_auto_campaigns(self) -> int:
+        async with self._lock:
+            row = self._execute(
+                "SELECT COUNT(*) AS cnt FROM user_auto_configs WHERE is_enabled = 1"
+            ).fetchone()
+            return int(row["cnt"] or 0) if row else 0
+
+    async def list_auto_campaign_events(self, *, since: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        async with self._lock:
+            if since is None:
+                rows = self._execute(
+                    """
+                    SELECT user_id, started_at
+                    FROM auto_campaign_events
+                    ORDER BY started_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = self._execute(
+                    """
+                    SELECT user_id, started_at
+                    FROM auto_campaign_events
+                    WHERE started_at >= ?
+                    ORDER BY started_at DESC
+                    """,
+                    (since.isoformat(),),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def list_auto_delivery_events(self, *, since: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        async with self._lock:
+            if since is None:
+                rows = self._execute(
+                    """
+                    SELECT user_id, sent_count, delivered_at
+                    FROM auto_delivery_events
+                    ORDER BY delivered_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = self._execute(
+                    """
+                    SELECT user_id, sent_count, delivered_at
+                    FROM auto_delivery_events
+                    WHERE delivered_at >= ?
+                    ORDER BY delivered_at DESC
+                    """,
+                    (since.isoformat(),),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
     async def toggle_target_chat(
         self,
         user_id: int,
@@ -679,7 +780,14 @@ class Storage:
         async with self._lock:
             return self._list_user_account_chats_locked(account_id, owner_id=owner_id)
 
-    async def update_stats(self, user_id: int, *, sent: int, errors: List[str]) -> None:
+    async def update_stats(
+        self,
+        user_id: int,
+        *,
+        sent: int,
+        errors: List[str],
+        delivered_at: Optional[str] = None,
+    ) -> None:
         async with self._lock:
             self._ensure_user_auto_locked(user_id)
             stats = self._execute(
@@ -703,6 +811,14 @@ class Storage:
                     "\n".join(errors) if errors else None,
                 ),
             )
+            if sent > 0:
+                self._execute(
+                    """
+                    INSERT INTO auto_delivery_events (id, user_id, sent_count, delivered_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (uuid4().hex, user_id, int(sent), delivered_at or datetime.utcnow().isoformat()),
+                )
             self._commit()
 
     async def list_known_chats(
@@ -1283,6 +1399,37 @@ class Storage:
                 sent_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, day_key)
             )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_campaign_events (
+                id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                started_at TEXT NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_auto_campaign_events_started
+            ON auto_campaign_events(started_at)
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_delivery_events (
+                id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                delivered_at TEXT NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_auto_delivery_events_delivered
+            ON auto_delivery_events(delivered_at)
             """
         )
         self._execute(

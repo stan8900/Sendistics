@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as datetime_time
 from pathlib import Path
@@ -32,6 +31,7 @@ from app.keyboards import (
     my_account_keyboard,
 )
 from app.pdf_reports import build_payments_pdf
+from app.runtime_config import create_storage_from_env
 from app.states import (
     AccountStates,
     AdminLoginStates,
@@ -43,7 +43,6 @@ from app.states import (
     PaymentStates,
     SharedProxyStates,
 )
-from app.storage import Storage
 from app.user_sender import UserSender, build_telethon_proxy
 from telethon import TelegramClient
 from telethon.errors import (
@@ -302,44 +301,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Missng BOT_TOKEN")
 
-database_url = os.getenv("DATABASE_URL") or None
-database_required = os.getenv("DATABASE_URL_REQUIRED", "false").lower() in {"1", "true", "yes"}
-storage_path_env = os.getenv("STORAGE_PATH")
-if storage_path_env:
-    storage_path = Path(storage_path_env)
-    if not storage_path.is_absolute():
-        storage_path = (BASE_DIR / storage_path).resolve()
-else:
-    storage_path = (BASE_DIR / "data" / "storage.db").resolve()
-
-if storage_path.suffix == ".json":
-    legacy_storage_path = storage_path
-    storage_path = storage_path.with_suffix(".db")
-else:
-    legacy_storage_path = storage_path.with_suffix(".json")
-
-
-def create_storage() -> Storage:
-    if database_url:
-        attempts = 5
-        for attempt in range(1, attempts + 1):
-            try:
-                logger.info("Используем PostgreSQL хранилище (попытка %s/%s).", attempt, attempts)
-                return Storage(storage_path, legacy_json_path=legacy_storage_path, database_url=database_url)
-            except Exception:
-                logger.exception("Не удалось подключиться к PostgreSQL (попытка %s).", attempt)
-                if attempt == attempts:
-                    if database_required:
-                        raise
-                    logger.warning("Переходим на локальную SQLite-базу по пути %s.", storage_path)
-                    break
-                wait_for = min(5, attempt)
-                logger.info("Повторяем подключение через %s c.", wait_for)
-                time.sleep(wait_for)
-    return Storage(storage_path, legacy_json_path=legacy_storage_path)
-
-
-storage = create_storage()
+storage = create_storage_from_env()
 
 tg_user_api_id_raw = os.getenv("TG_USER_API_ID")
 tg_user_api_hash = os.getenv("TG_USER_API_HASH")
@@ -390,11 +352,11 @@ if bot["account_manager"]:
 else:
     bot["invite_engine"] = None
 
-PAYMENT_AMOUNT = 100_000
-PAYMENT_CURRENCY = "UZS"
-PAYMENT_DESCRIPTION = "Оплата услуг логистического бота"
-PAYMENT_VALID_DAYS = 30
-PAYMENT_CARD_TARGET = "9860 1701 1433 3116"
+PAYMENT_AMOUNT = int(os.getenv("PAYMENT_AMOUNT", "100000"))
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "UZS")
+PAYMENT_DESCRIPTION = os.getenv("PAYMENT_DESCRIPTION", "Оплата услуг логистического бота")
+PAYMENT_VALID_DAYS = int(os.getenv("PAYMENT_VALID_DAYS", "30"))
+PAYMENT_CARD_TARGET = os.getenv("PAYMENT_CARD_TARGET", "9860 1701 1433 3116")
 PAYMENT_CARD_PROMPT = "Введите номер карты (12–19 цифр).\nДля отмены используйте /cancel."
 PAYMENT_CARD_NAME_PROMPT = "Укажите имя, как на карте.\nДля отмены используйте /cancel."
 PAYMENT_CARD_INVALID_MESSAGE = (
@@ -774,6 +736,111 @@ async def build_admin_payments_text(limit: int = 50) -> str:
             f"     Карта: {card_number}\n"
             f"     Статус: {status_name} ({created}{expires_text})"
         )
+    return "\n".join(lines)
+
+
+def admin_stats_keyboard(period: str) -> InlineKeyboardMarkup:
+    period = period if period in {"day", "week", "month", "all"} else "day"
+    labels = {
+        "day": "День",
+        "week": "Неделя",
+        "month": "Месяц",
+        "all": "Всё",
+    }
+    rows = []
+    for first, second in (("day", "week"), ("month", "all")):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    ("● " if period == first else "") + labels[first],
+                    callback_data=f"admin_stats:{first}",
+                ),
+                InlineKeyboardButton(
+                    ("● " if period == second else "") + labels[second],
+                    callback_data=f"admin_stats:{second}",
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="auto:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_stats_period(period: str) -> tuple[str, Optional[datetime]]:
+    now = datetime.utcnow()
+    if period == "week":
+        return "за 7 дней", now - timedelta(days=7)
+    if period == "month":
+        return "за 30 дней", now - timedelta(days=30)
+    if period == "all":
+        return "за всё время", None
+    return "за сегодня", now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def build_admin_stats_text(period: str = "day") -> str:
+    period_title, since = admin_stats_period(period)
+    payments = await storage.get_all_payments()
+    period_payments = []
+    approved_in_period = []
+    pending_in_period = []
+    declined_in_period = []
+    active_user_ids = set()
+    now = datetime.utcnow()
+    active_threshold = now - timedelta(days=PAYMENT_VALID_DAYS)
+
+    for payment in payments:
+        created_at = parse_iso_datetime(payment.get("created_at"))
+        resolved_at = parse_iso_datetime(payment.get("resolved_at"))
+        status = payment.get("status")
+        if since is None or (created_at and created_at >= since):
+            period_payments.append(payment)
+            if status == "pending":
+                pending_in_period.append(payment)
+            elif status == "declined":
+                declined_in_period.append(payment)
+        if status == "approved" and resolved_at:
+            if since is None or resolved_at >= since:
+                approved_in_period.append(payment)
+            if resolved_at >= active_threshold:
+                active_user_ids.add(int(payment.get("user_id")))
+
+    campaign_starts = await storage.count_auto_campaign_starts(since=since)
+    deliveries = await storage.count_auto_deliveries(since=since)
+    active_campaigns = await storage.count_active_auto_campaigns()
+    revenue = len(approved_in_period) * PAYMENT_AMOUNT
+
+    latest_payment = await storage.latest_payment_timestamp()
+    if latest_payment:
+        payment_due = latest_payment + timedelta(days=PAYMENT_VALID_DAYS)
+        global_payment_line = f"Общая оплата активна до {payment_due.strftime('%d.%m.%Y')}"
+    else:
+        global_payment_line = "Общая оплата не найдена"
+
+    lines = [
+        f"📊 <b>Админ-аналитика {period_title}</b>",
+        "",
+        "💳 <b>Платежи и подписки</b>",
+        f"Заявок на оплату: {len(period_payments)}",
+        f"Оформлено подписок: {len(approved_in_period)}",
+        f"Ожидают подтверждения: {len(pending_in_period)}",
+        f"Отклонено: {len(declined_in_period)}",
+        f"Активных подписок сейчас: {len(active_user_ids)}",
+        f"Выручка периода: {format_currency(revenue, PAYMENT_CURRENCY)}",
+        global_payment_line,
+        "",
+        "📨 <b>Рассылки</b>",
+        f"Запусков рассылки: {campaign_starts}",
+        f"Отправлено сообщений: {deliveries}",
+        f"Активно сейчас: {active_campaigns}",
+    ]
     return "\n".join(lines)
 
 
@@ -1831,42 +1898,28 @@ async def cb_main_stats(call: types.CallbackQuery) -> None:
         await call.answer("Доступно только администраторам.", show_alert=True)
         return
     await call.answer()
-    auto = await storage.get_auto(call.from_user.id)
-    stats = auto.get("stats") or {}
-    sent_total = stats.get("sent_total", 0)
-    last_sent_at = stats.get("last_sent_at")
-    last_error = stats.get("last_error")
-    latest_payment = await storage.latest_payment_timestamp()
-    payment_valid = await storage.has_recent_payment(within_days=PAYMENT_VALID_DAYS)
-    human_time = "—"
-    if last_sent_at:
-        try:
-            dt = datetime.fromisoformat(last_sent_at)
-            human_time = dt.strftime("%d.%m.%Y %H:%M:%S")
-        except ValueError:
-            human_time = last_sent_at
-    if latest_payment:
-        payment_due = latest_payment + timedelta(days=PAYMENT_VALID_DAYS)
-        payment_line = (
-            f"Оплата действительна до {payment_due.strftime('%d.%m.%Y')}"
-            if payment_valid
-            else f"Оплата просрочена {payment_due.strftime('%d.%m.%Y')}"
-        )
-    else:
-        payment_line = "Оплата не найдена"
-    lines = [
-        "📊 <b>Статистика авторассылки</b>",
-        f"Всего отправлено: {sent_total}",
-        f"Последняя отправка: {human_time}",
-        payment_line,
-    ]
-    if last_error:
-        lines.append("Ошибки последнего запуска:")
-        lines.append(last_error)
-    else:
-        lines.append("Ошибок не зафиксировано.")
-    _, keyboard, _ = await build_main_menu(call.from_user.id)
-    await call.message.edit_text("\n".join(lines), reply_markup=keyboard)
+    await safe_edit_text(
+        call.message,
+        await build_admin_stats_text("day"),
+        reply_markup=admin_stats_keyboard("day"),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("admin_stats:"))
+async def cb_admin_stats_period(call: types.CallbackQuery) -> None:
+    if not await is_admin_user(call.from_user.id):
+        await call.answer("Доступно только администраторам.", show_alert=True)
+        return
+    period = call.data.split(":", 1)[1]
+    if period not in {"day", "week", "month", "all"}:
+        await call.answer("Неизвестный период.", show_alert=True)
+        return
+    await call.answer()
+    await safe_edit_text(
+        call.message,
+        await build_admin_stats_text(period),
+        reply_markup=admin_stats_keyboard(period),
+    )
 
 
 @dp.callback_query_handler(lambda c: c.data == "main:groups")
@@ -2581,6 +2634,7 @@ async def cb_auto_start(call: types.CallbackQuery) -> None:
         )
         return
     await storage.set_auto_enabled(call.from_user.id, True)
+    await storage.record_auto_campaign_start(call.from_user.id)
     auto_sender: AutoSender = call.bot["auto_sender"]
     await auto_sender.refresh_user(call.from_user.id)
     await call.message.answer("Авторассылка запущена.")

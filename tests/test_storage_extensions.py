@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from app.storage import Storage
@@ -179,6 +180,41 @@ class StorageExtensionsTest(unittest.TestCase):
             )
             self.assertFalse(fourth_reserved)
             self.assertEqual(fourth_reason, "daily_limit")
+
+        asyncio.run(runner())
+
+    def test_admin_analytics_counts_campaigns_deliveries_and_active_auto(self) -> None:
+        async def runner() -> None:
+            await self.storage.record_auto_campaign_start(
+                1,
+                started_at="2026-05-04T08:00:00",
+            )
+            await self.storage.record_auto_campaign_start(
+                2,
+                started_at="2026-04-01T08:00:00",
+            )
+            await self.storage.update_stats(
+                1,
+                sent=1,
+                errors=[],
+                delivered_at="2026-05-04T08:00:00",
+            )
+            await self.storage.update_stats(
+                1,
+                sent=1,
+                errors=[],
+                delivered_at="2026-04-01T08:00:00",
+            )
+            await self.storage.set_auto_message(1, "first")
+            await self.storage.set_auto_enabled(1, True)
+
+            since = datetime.fromisoformat("2026-05-01T00:00:00")
+
+            self.assertEqual(await self.storage.count_auto_campaign_starts(), 2)
+            self.assertEqual(await self.storage.count_auto_campaign_starts(since=since), 1)
+            self.assertEqual(await self.storage.count_auto_deliveries(), 2)
+            self.assertEqual(await self.storage.count_auto_deliveries(since=since), 1)
+            self.assertEqual(await self.storage.count_active_auto_campaigns(), 1)
 
         asyncio.run(runner())
 
