@@ -2768,9 +2768,21 @@ if __name__ == "__main__":
     except ValueError:
         retry_delay = 5
     retry_delay = max(1, retry_delay)
+    polling_lock_name = f"telegram_polling:{BOT_TOKEN}"
     while True:
         try:
-            executor.start_polling(dp, skip_updates=False, on_startup=on_startup, on_shutdown=on_shutdown)
+            lock_acquired = asyncio.run(storage.try_acquire_runtime_lock(polling_lock_name))
+            if not lock_acquired:
+                logger.warning(
+                    "Другой инстанс уже держит polling-lock. Ждём %s c и пробуем снова.",
+                    retry_delay,
+                )
+                asyncio.run(asyncio.sleep(retry_delay))
+                continue
+            try:
+                executor.start_polling(dp, skip_updates=False, on_startup=on_startup, on_shutdown=on_shutdown)
+            finally:
+                asyncio.run(storage.release_runtime_lock(polling_lock_name))
             break
         except exceptions.TerminatedByOtherGetUpdates:
             logger.warning(

@@ -1587,6 +1587,25 @@ class Storage:
             self._commit()
             return bool(getattr(cursor, "rowcount", 0))
 
+    async def try_acquire_runtime_lock(self, name: str) -> bool:
+        if not self._is_postgres:
+            return True
+        async with self._lock:
+            row = self._execute(
+                "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+                (name,),
+            ).fetchone()
+            return bool(row and row["acquired"])
+
+    async def release_runtime_lock(self, name: str) -> None:
+        if not self._is_postgres:
+            return
+        async with self._lock:
+            self._execute(
+                "SELECT pg_advisory_unlock(hashtext(?))",
+                (name,),
+            )
+
     async def get_shared_proxy(self) -> Optional[Dict[str, Any]]:
         raw = await self.get_system_setting("shared_proxy")
         if not raw:

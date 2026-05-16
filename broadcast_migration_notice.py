@@ -17,8 +17,8 @@ DEFAULT_MESSAGE = (
     "Оплаты сохранены. Если у вас появляется сообщение, что нужно оплатить, "
     "заполните все детали — админ проверит и даст аппрув."
 )
-ENABLE_ENV_VAR = "ENABLE_MIGRATION_BROADCAST"
-BROADCAST_SETTING_KEY = "migration_broadcast_notice_status"
+DISABLE_ENV_VAR = "DISABLE_MIGRATION_BROADCAST"
+BROADCAST_SETTING_KEY = "migration_broadcast_notice_v2_status"
 BROADCAST_STATUS_STARTED = "started"
 BROADCAST_STATUS_DONE = "done"
 logger = logging.getLogger(__name__)
@@ -122,7 +122,8 @@ async def run_startup_broadcast_once(
     message: str = DEFAULT_MESSAGE,
     delay: float = 0.1,
 ) -> None:
-    if os.getenv(ENABLE_ENV_VAR, "").lower() not in {"1", "true", "yes"}:
+    if os.getenv(DISABLE_ENV_VAR, "").lower() in {"1", "true", "yes"}:
+        logger.info("Migration broadcast disabled by %s.", DISABLE_ENV_VAR)
         return
 
     claimed = await storage.claim_system_setting_if_missing(
@@ -165,9 +166,9 @@ async def main() -> None:
         print("\ndry-run only. Run with --send to send the message.")
         return
 
-    if os.getenv(ENABLE_ENV_VAR, "").lower() not in {"1", "true", "yes"}:
+    if os.getenv(DISABLE_ENV_VAR, "").lower() in {"1", "true", "yes"}:
         print(
-            f"\nsending is disabled. Set {ENABLE_ENV_VAR}=true and run with --send "
+            f"\nsending is disabled by {DISABLE_ENV_VAR}. Unset it or set it to false "
             "to send the message."
         )
         return
