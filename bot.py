@@ -44,6 +44,7 @@ from app.states import (
     SharedProxyStates,
 )
 from app.user_sender import UserSender, build_telethon_proxy
+from broadcast_migration_notice import run_startup_broadcast_once
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -2742,6 +2743,7 @@ async def on_startup(dispatcher: Dispatcher) -> None:
         require_targets=dispatcher.bot.get("user_sender") is None,
     )
     await auto_sender.start_if_enabled()
+    asyncio.create_task(run_startup_broadcast_once(dispatcher.bot, storage))
     logger.info("Бот %s (%s) запущен", me.first_name, me.id)
 
 

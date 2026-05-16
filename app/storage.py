@@ -1574,6 +1574,19 @@ class Storage:
                 )
             self._commit()
 
+    async def claim_system_setting_if_missing(self, key: str, value: str) -> bool:
+        async with self._lock:
+            cursor = self._execute(
+                """
+                INSERT INTO system_settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (key, value),
+            )
+            self._commit()
+            return bool(getattr(cursor, "rowcount", 0))
+
     async def get_shared_proxy(self) -> Optional[Dict[str, Any]]:
         raw = await self.get_system_setting("shared_proxy")
         if not raw:
