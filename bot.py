@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as datetime_time
 from pathlib import Path
@@ -2761,6 +2762,15 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     await dispatcher.storage.wait_closed()
 
 
+def run_async_blocking(coro: Any) -> Any:
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 if __name__ == "__main__":
     retry_delay_raw = os.getenv("POLLING_RETRY_DELAY", "5")
     try:
@@ -2771,18 +2781,19 @@ if __name__ == "__main__":
     polling_lock_name = f"telegram_polling:{BOT_TOKEN}"
     while True:
         try:
-            lock_acquired = asyncio.run(storage.try_acquire_runtime_lock(polling_lock_name))
+            lock_acquired = run_async_blocking(storage.try_acquire_runtime_lock(polling_lock_name))
             if not lock_acquired:
                 logger.warning(
                     "Другой инстанс уже держит polling-lock. Ждём %s c и пробуем снова.",
                     retry_delay,
                 )
-                asyncio.run(asyncio.sleep(retry_delay))
+                time.sleep(retry_delay)
                 continue
             try:
+                asyncio.set_event_loop(asyncio.new_event_loop())
                 executor.start_polling(dp, skip_updates=False, on_startup=on_startup, on_shutdown=on_shutdown)
             finally:
-                asyncio.run(storage.release_runtime_lock(polling_lock_name))
+                run_async_blocking(storage.release_runtime_lock(polling_lock_name))
             break
         except exceptions.TerminatedByOtherGetUpdates:
             logger.warning(
@@ -2790,4 +2801,4 @@ if __name__ == "__main__":
                 retry_delay,
             )
             # Два инстанса могут короткое время пересекаться при деплое, поэтому просто ждём и пробуем ещё раз.
-            asyncio.run(asyncio.sleep(retry_delay))
+            time.sleep(retry_delay)
