@@ -1369,6 +1369,8 @@ async def handle_group_text(message: types.Message) -> None:
 
 
 async def on_startup(dispatcher: Dispatcher) -> None:
+    global USE_USER_DELIVERY
+
     me = await dispatcher.bot.get_me()
     mtproto_delivery: Optional[UserDelivery] = dispatcher.bot.get("user_delivery")
 
@@ -1377,9 +1379,16 @@ async def on_startup(dispatcher: Dispatcher) -> None:
 
     send_callable: Callable[[int, str], Awaitable[None]] = send_via_bot
     if mtproto_delivery:
-        await mtproto_delivery.start()
-        await mtproto_delivery.sync_known_chats(storage)
-        send_callable = mtproto_delivery.send_text
+        try:
+            await mtproto_delivery.start()
+            await mtproto_delivery.sync_known_chats(storage)
+            send_callable = mtproto_delivery.send_text
+        except Exception:
+            logger.exception("Пользовательская Telegram-сессия недоступна. Рассылка будет выполняться ботом.")
+            await mtproto_delivery.stop()
+            dispatcher.bot["user_delivery"] = None
+            mtproto_delivery = None
+            USE_USER_DELIVERY = False
     auto_sender = AutoSender(
         send_callable,
         storage,
