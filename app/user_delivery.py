@@ -20,7 +20,7 @@ class UserDelivery:
         session_string: str,
         dialogs_limit: Optional[int] = None,
     ) -> None:
-        self._client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        self._client = TelegramClient(StringSession(session_string), api_id, api_hash, receive_updates=False)
         if dialogs_limit is not None:
             self._dialogs_limit: Optional[int] = max(1, dialogs_limit)
         else:
