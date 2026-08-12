@@ -40,9 +40,8 @@ class UserDelivery:
         self._connected = True
 
     async def stop(self) -> None:
-        if not self._connected:
-            return
-        await self._client.disconnect()
+        if self._connected or self._client.is_connected():
+            await self._client.disconnect()
         self._connected = False
 
     async def send_text(self, chat_id: int, text: str) -> None:
